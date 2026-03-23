@@ -11,6 +11,7 @@ use {
     std::{num::NonZeroUsize, sync::Arc},
 };
 
+pub mod on_chain;
 mod vote_keyed;
 /// Stake-weighted leader schedule for one epoch.
 pub use vote_keyed::LeaderSchedule;

@@ -115,6 +115,13 @@ pub static BUILTINS: &[BuiltinPrototype] = &[
         program_id: solana_sdk_ids::zk_elgamal_proof_program::id(),
         register_fn: solana_zk_elgamal_proof_program::Entrypoint::register,
     }),
+    testable_prototype!(BuiltinPrototype {
+        core_bpf_migration_config: None,
+        name: leader_schedule_program,
+        enable_feature_id: Some(feature_set::on_chain_leader_schedule::id()),
+        program_id: solana_leader_schedule_program::id(),
+        register_fn: solana_leader_schedule_program::Entrypoint::register,
+    }),
 ];
 
 pub static STATELESS_BUILTINS: &[StatelessBuiltinPrototype] = &[StatelessBuiltinPrototype {
@@ -338,6 +345,26 @@ pub mod test_only {
             datapoint_name: "migrate_builtin_to_core_bpf_zk_elgamal_proof_program",
         };
     }
+
+    pub mod leader_schedule_program {
+        pub mod feature {
+            solana_pubkey::declare_id!("9FpRbfbzMYoR2xnFE4VBbJVkHpXdoyJRSmFhkFGbJTC3");
+        }
+        pub mod source_buffer {
+            solana_pubkey::declare_id!("7sZnB87trMSfC2YG1GkEzrJPod7rF9rrPNAhDVRKGfhT");
+        }
+        pub mod upgrade_authority {
+            solana_pubkey::declare_id!("Gg2aYDe4hwoSPEJfLvXZPgFiUBqcbBMkHPHcqTwJtDL6");
+        }
+        pub const CONFIG: super::CoreBpfMigrationConfig = super::CoreBpfMigrationConfig {
+            source_buffer_address: source_buffer::id(),
+            upgrade_authority_address: Some(upgrade_authority::id()),
+            feature_id: feature::id(),
+            migration_target: super::CoreBpfMigrationTargetType::Builtin,
+            verified_build_hash: None,
+            datapoint_name: "migrate_builtin_to_core_bpf_leader_schedule_program",
+        };
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +409,10 @@ mod tests {
         assert_eq!(
             &super::BUILTINS[8].core_bpf_migration_config,
             &Some(super::test_only::zk_elgamal_proof_program::CONFIG)
+        );
+        assert_eq!(
+            &super::BUILTINS[9].core_bpf_migration_config,
+            &Some(super::test_only::leader_schedule_program::CONFIG)
         );
     }
 }

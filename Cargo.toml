@@ -68,6 +68,7 @@ members = [
     "programs/compute-budget",
     "programs/compute-budget-bench",
     "programs/ed25519-tests",
+    "programs/leader-schedule",
     "programs/loader-v4",
     "programs/system",
     "programs/vote",
@@ -455,6 +456,7 @@ solana-keypair = "3.1.2"
 solana-last-restart-slot = "3.0.0"
 solana-lattice-hash = { path = "lattice-hash", version = "=4.1.0-alpha.0", features = ["agave-unstable-api"] }
 solana-leader-schedule = { path = "leader-schedule", version = "=4.1.0-alpha.0", features = ["agave-unstable-api"] }
+solana-leader-schedule-program = { path = "programs/leader-schedule", version = "=4.1.0-alpha.0", features = ["agave-unstable-api"] }
 solana-ledger = { path = "ledger", version = "=4.1.0-alpha.0", features = ["agave-unstable-api"] }
 solana-loader-v2-interface = "3.0.0"
 solana-loader-v3-interface = "6.1.0"

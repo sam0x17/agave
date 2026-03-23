@@ -18,6 +18,7 @@ pub mod installed_scheduler_pool;
 pub mod leader_schedule_utils;
 pub mod loader_utils;
 pub mod non_circulating_supply;
+pub(crate) mod on_chain_leader_schedule;
 pub mod prioritization_fee;
 pub mod prioritization_fee_cache;
 mod read_optimized_dashmap;

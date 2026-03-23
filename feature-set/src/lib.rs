@@ -1309,6 +1309,10 @@ pub mod direct_account_pointers_in_program_input {
     solana_pubkey::declare_id!("ptrXWLkSDMZZmZN8GAT6W5yW4EvYByfw6cRRHbXwQNS");
 }
 
+pub mod on_chain_leader_schedule {
+    solana_pubkey::declare_id!("AzY6X6WxuXLC4khfYUWrp4JNCiuhvv8atwHtYXW4Guwy");
+}
+
 pub mod upgrade_bpf_stake_program_to_v5 {
     solana_pubkey::declare_id!("STk5Xj8hdAx3sTzmtJ3QysKkq6X2A3yj73JtxttiRyk");
 
@@ -2356,6 +2360,10 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             upgrade_bpf_stake_program_to_v5::id(),
             "SIMD-0490: Upgrade BPF Stake Program to v5.0.0",
+        ),
+        (
+            on_chain_leader_schedule::id(),
+            "on-chain leader schedule accounts",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
     ]

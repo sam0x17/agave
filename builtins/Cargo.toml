@@ -18,6 +18,7 @@ agave-feature-set = { workspace = true }
 solana-bpf-loader-program = { workspace = true }
 solana-compute-budget-program = { workspace = true }
 solana-hash = { workspace = true }
+solana-leader-schedule-program = { workspace = true }
 solana-loader-v4-program = { workspace = true }
 solana-program-runtime = { workspace = true }
 solana-pubkey = { workspace = true }

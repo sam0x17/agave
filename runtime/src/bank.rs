@@ -1796,6 +1796,14 @@ impl Bank {
             );
         }
 
+        // Update on-chain leader schedule accounts.
+        if self
+            .feature_set
+            .is_active(&feature_set::on_chain_leader_schedule::id())
+        {
+            crate::on_chain_leader_schedule::update_on_chain_leader_schedule(self);
+        }
+
         report_new_epoch_metrics(
             epoch,
             slot,
