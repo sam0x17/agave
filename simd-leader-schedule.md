@@ -119,8 +119,8 @@ The two accounts live at well-known addresses derived as Program Derived
 Addresses (PDAs) from the owning program:
 
 ```
-current_schedule = PDA(leader_schedule_program_id, ["current"])
-next_schedule    = PDA(leader_schedule_program_id, ["next"])
+current_schedule = PDA(leader_schedule_program_id, ["current_schedule"])
+next_schedule    = PDA(leader_schedule_program_id, ["next_schedule"])
 ```
 
 Using PDAs rather than vanity-ground addresses ensures the addresses are
@@ -131,7 +131,7 @@ subscribe to exactly two stable addresses.
 ### Owner Program
 
 These accounts are owned by a new native program, the **Leader Schedule
-program** (`LeaderSchedu1e1111111111111111111111111111111`). This program:
+program**. This program:
 
 - Rejects all instructions (the accounts are read-only from the perspective of
   transactions)
@@ -145,23 +145,31 @@ program** (`LeaderSchedu1e1111111111111111111111111111111`). This program:
 At each epoch boundary (when `parent.epoch() < new.epoch()`), the runtime:
 
 1. Copies the contents of `next_schedule` into `current_schedule`
-2. Computes the leader schedule for the upcoming epoch (epoch + 1) using the
-   same `leader_schedule_utils::leader_schedule()` logic that already populates
-   the `LeaderScheduleCache`
+2. Computes the leader schedule for `current_epoch + 1` using the same
+   stake-weighted shuffle (`LeaderSchedule::new()`) that already populates the
+   `LeaderScheduleCache`
 3. Serializes the new schedule into the binary format described above
 4. Writes the result to `next_schedule`
-5. Adjusts lamport balances for rent exemption on both accounts
 
-This integrates alongside existing epoch-boundary processing in
-`process_new_epoch()`, after vote account stake snapshots are taken.
+Account lamport balances are set to the rent-exempt minimum (or 1 lamport,
+whichever is greater) on each write.
+
+This integrates into the existing epoch-boundary processing in
+`process_new_epoch()`, after vote account stake snapshots are taken and
+`update_epoch_stakes()` has been called.
 
 #### Feature Activation
 
 On the first epoch boundary after feature activation:
 
-1. Both accounts are created with the system-allocated rent-exempt balance
+1. Both accounts are created with the rent-exempt balance (minimum 1 lamport,
+   since zero-lamport accounts are treated as non-existent by the runtime)
 2. `current_schedule` is populated with the current epoch's leader schedule
-3. `next_schedule` is populated with the next epoch's leader schedule
+3. `next_schedule` is populated with the next epoch's leader schedule, if vote
+   account stakes for that epoch are available. If not yet available (possible
+   at the very first epoch boundary after activation), it is populated with the
+   current epoch's schedule as a fallback and will be overwritten at the next
+   epoch boundary
 
 #### Consistency
 
