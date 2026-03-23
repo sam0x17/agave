@@ -166,6 +166,7 @@ impl FeatureSet {
             vote_account_initialize_v2: self.is_active(&vote_account_initialize_v2::id()),
             direct_account_pointers_in_program_input: self
                 .is_active(&direct_account_pointers_in_program_input::id()),
+            on_chain_leader_schedule: self.is_active(&on_chain_leader_schedule::id()),
         }
     }
 }

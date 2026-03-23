@@ -16,6 +16,13 @@ pub trait InvokeContextCallback {
         0
     }
 
+    /// Returns the leader identity pubkey for the given absolute slot.
+    /// Returns `None` if the slot is outside the range covered by the
+    /// current and next epoch schedules.
+    fn get_slot_leader(&self, _slot: Slot) -> Option<Pubkey> {
+        None
+    }
+
     /// Returns true if the program_id corresponds to a precompiled program
     fn is_precompile(&self, _program_id: &Pubkey) -> bool {
         false

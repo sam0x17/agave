@@ -12,7 +12,7 @@
 //! │   epoch: u64                                        │
 //! │   num_leaders: u16                                  │
 //! │   num_slot_blocks: u32                              │
-//! │   _reserved: [u8; 2]                                │
+//! │   slots_per_block: u16                              │
 //! ├─────────────────────────────────────────────────────┤
 //! │ Identity Table (num_leaders × 32 bytes)             │
 //! │   identities: [Pubkey; num_leaders]                 │
@@ -37,18 +37,16 @@ pub const IDENTITY_SIZE: usize = 32;
 /// Size of one schedule index entry (u16).
 pub const SCHEDULE_INDEX_SIZE: usize = 2;
 
-/// Number of consecutive leader slots per block (matching NUM_CONSECUTIVE_LEADER_SLOTS).
-pub const SLOTS_PER_BLOCK: usize = 4;
-
 /// Serialize a leader schedule into the on-chain binary format.
 ///
-/// The `slot_leaders` slice contains one `(identity_pubkey, slot_index)` per
-/// slot in the epoch (not per block). This function groups them into 4-slot
-/// blocks, deduplicates identities into a sorted table, and produces the
-/// compact binary encoding.
+/// `slots_per_block` is the number of consecutive slots assigned to each
+/// leader (currently `NUM_CONSECUTIVE_LEADER_SLOTS`, i.e. 4). It is stored
+/// in the header so consumers can decode the schedule without hardcoding
+/// the constant.
 pub fn serialize_leader_schedule(
     slot_leaders: &[Pubkey],
     epoch: Epoch,
+    slots_per_block: usize,
 ) -> Vec<u8> {
     // Build sorted, deduplicated identity table and index map.
     let mut unique_identities: Vec<Pubkey> = slot_leaders.iter().copied().collect();
@@ -61,8 +59,8 @@ pub fn serialize_leader_schedule(
         .map(|(i, pk)| (*pk, i as u16))
         .collect();
 
-    // One entry per 4-slot leader block.
-    let num_slot_blocks = (slot_leaders.len() + SLOTS_PER_BLOCK - 1) / SLOTS_PER_BLOCK;
+    // One entry per leader block.
+    let num_slot_blocks = (slot_leaders.len() + slots_per_block - 1) / slots_per_block;
     let num_leaders = unique_identities.len();
 
     let data_len = HEADER_SIZE
@@ -74,7 +72,7 @@ pub fn serialize_leader_schedule(
     data[0..8].copy_from_slice(&epoch.to_le_bytes());
     data[8..10].copy_from_slice(&(num_leaders as u16).to_le_bytes());
     data[10..14].copy_from_slice(&(num_slot_blocks as u32).to_le_bytes());
-    // bytes 14..16 are reserved (zeroed)
+    data[14..16].copy_from_slice(&(slots_per_block as u16).to_le_bytes());
 
     // Write identity table.
     let identities_start = HEADER_SIZE;
@@ -83,10 +81,10 @@ pub fn serialize_leader_schedule(
         data[offset..offset + IDENTITY_SIZE].copy_from_slice(pubkey.as_ref());
     }
 
-    // Write schedule indices (one per 4-slot block, using the first slot's leader).
+    // Write schedule indices (one per leader block, using the first slot's leader).
     let schedule_start = identities_start + num_leaders * IDENTITY_SIZE;
     for block in 0..num_slot_blocks {
-        let slot = block * SLOTS_PER_BLOCK;
+        let slot = block * slots_per_block;
         let leader = &slot_leaders[slot];
         let idx = identity_to_index[leader];
         let offset = schedule_start + block * SCHEDULE_INDEX_SIZE;
@@ -102,6 +100,7 @@ pub struct LeaderScheduleHeader {
     pub epoch: Epoch,
     pub num_leaders: u16,
     pub num_slot_blocks: u32,
+    pub slots_per_block: u16,
 }
 
 /// Deserialize the header from raw account data.
@@ -112,6 +111,11 @@ pub fn deserialize_header(data: &[u8]) -> Option<LeaderScheduleHeader> {
     let epoch = u64::from_le_bytes(data[0..8].try_into().ok()?);
     let num_leaders = u16::from_le_bytes(data[8..10].try_into().ok()?);
     let num_slot_blocks = u32::from_le_bytes(data[10..14].try_into().ok()?);
+    let slots_per_block = u16::from_le_bytes(data[14..16].try_into().ok()?);
+
+    if slots_per_block == 0 {
+        return None;
+    }
 
     let expected_len = HEADER_SIZE
         + num_leaders as usize * IDENTITY_SIZE
@@ -124,13 +128,14 @@ pub fn deserialize_header(data: &[u8]) -> Option<LeaderScheduleHeader> {
         epoch,
         num_leaders,
         num_slot_blocks,
+        slots_per_block,
     })
 }
 
 /// Look up the leader identity pubkey for a given slot-block index.
 ///
-/// `block_index` is the 0-based index of the 4-slot block within the epoch
-/// (i.e., `slot_index_within_epoch / 4`).
+/// `block_index` is the 0-based index of the leader block within the epoch
+/// (i.e., `slot_index_within_epoch / slots_per_block`).
 pub fn get_leader_at_block(data: &[u8], block_index: usize) -> Option<Pubkey> {
     let header = deserialize_header(data)?;
     if block_index >= header.num_slot_blocks as usize {
@@ -153,6 +158,16 @@ pub fn get_leader_at_block(data: &[u8], block_index: usize) -> Option<Pubkey> {
     ))
 }
 
+/// Look up the leader identity pubkey for a given slot within the epoch.
+///
+/// `slot_index` is the 0-based slot offset within the epoch. The
+/// `slots_per_block` value is read from the header.
+pub fn get_leader_at_slot_index(data: &[u8], slot_index: usize) -> Option<Pubkey> {
+    let header = deserialize_header(data)?;
+    let block_index = slot_index / header.slots_per_block as usize;
+    get_leader_at_block(data, block_index)
+}
+
 /// Deserialize the full identity table from account data.
 pub fn get_identities(data: &[u8]) -> Option<Vec<Pubkey>> {
     let header = deserialize_header(data)?;
@@ -171,6 +186,8 @@ pub fn get_identities(data: &[u8]) -> Option<Vec<Pubkey>> {
 mod tests {
     use super::*;
 
+    const SLOTS_PER_BLOCK: usize = 4;
+
     #[test]
     fn test_serialize_deserialize_roundtrip() {
         let leaders = [
@@ -186,12 +203,13 @@ mod tests {
         ];
 
         let epoch = 42;
-        let data = serialize_leader_schedule(&slot_leaders, epoch);
+        let data = serialize_leader_schedule(&slot_leaders, epoch, SLOTS_PER_BLOCK);
 
         let header = deserialize_header(&data).unwrap();
         assert_eq!(header.epoch, epoch);
         assert_eq!(header.num_leaders, 3);
         assert_eq!(header.num_slot_blocks, 3);
+        assert_eq!(header.slots_per_block, 4);
 
         // Verify identities are sorted
         let identities = get_identities(&data).unwrap();
@@ -205,6 +223,12 @@ mod tests {
         assert_eq!(get_leader_at_block(&data, 1).unwrap(), leaders[1]);
         assert_eq!(get_leader_at_block(&data, 2).unwrap(), leaders[2]);
 
+        // Verify slot-level lookups
+        assert_eq!(get_leader_at_slot_index(&data, 0).unwrap(), leaders[0]);
+        assert_eq!(get_leader_at_slot_index(&data, 3).unwrap(), leaders[0]);
+        assert_eq!(get_leader_at_slot_index(&data, 4).unwrap(), leaders[1]);
+        assert_eq!(get_leader_at_slot_index(&data, 11).unwrap(), leaders[2]);
+
         // Out of bounds
         assert!(get_leader_at_block(&data, 3).is_none());
     }
@@ -213,7 +237,7 @@ mod tests {
     fn test_single_leader() {
         let leader = Pubkey::new_unique();
         let slot_leaders = vec![leader; 8]; // 2 blocks
-        let data = serialize_leader_schedule(&slot_leaders, 100);
+        let data = serialize_leader_schedule(&slot_leaders, 100, SLOTS_PER_BLOCK);
 
         let header = deserialize_header(&data).unwrap();
         assert_eq!(header.num_leaders, 1);
@@ -224,8 +248,27 @@ mod tests {
     }
 
     #[test]
+    fn test_non_standard_slots_per_block() {
+        // Simulate a future where slots_per_block != 4
+        let leaders = [Pubkey::new_unique(), Pubkey::new_unique()];
+        let slot_leaders: Vec<Pubkey> = vec![
+            leaders[0], leaders[0], // block 0 (2 slots)
+            leaders[1], leaders[1], // block 1 (2 slots)
+        ];
+        let data = serialize_leader_schedule(&slot_leaders, 1, 2);
+
+        let header = deserialize_header(&data).unwrap();
+        assert_eq!(header.slots_per_block, 2);
+        assert_eq!(header.num_slot_blocks, 2);
+
+        assert_eq!(get_leader_at_slot_index(&data, 0).unwrap(), leaders[0]);
+        assert_eq!(get_leader_at_slot_index(&data, 1).unwrap(), leaders[0]);
+        assert_eq!(get_leader_at_slot_index(&data, 2).unwrap(), leaders[1]);
+        assert_eq!(get_leader_at_slot_index(&data, 3).unwrap(), leaders[1]);
+    }
+
+    #[test]
     fn test_account_size_mainnet_scale() {
-        // Simulate mainnet: ~2000 validators, 432k slots/epoch
         let num_validators = 2000;
         let slots_per_epoch = 432_000;
         let num_blocks = slots_per_epoch / SLOTS_PER_BLOCK;
@@ -250,7 +293,7 @@ mod tests {
     fn test_truncated_data_returns_none() {
         let leader = Pubkey::new_unique();
         let slot_leaders = vec![leader; 4];
-        let data = serialize_leader_schedule(&slot_leaders, 0);
+        let data = serialize_leader_schedule(&slot_leaders, 0, SLOTS_PER_BLOCK);
 
         // Truncate the data
         assert!(deserialize_header(&data[..data.len() - 1]).is_none());

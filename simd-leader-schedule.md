@@ -13,8 +13,9 @@ feature: (fill in with feature tracking issues once accepted)
 ## Summary
 
 Store the leader schedule for the current and upcoming epochs in on-chain
-accounts, enabling downstream consumers to subscribe to account updates and
-on-chain programs to verify leader identity.
+accounts and provide a `sol_get_slot_leader` syscall, enabling downstream
+consumers to subscribe to schedule changes and on-chain programs to verify
+leader identity efficiently.
 
 ## Motivation
 
@@ -37,7 +38,7 @@ This makes it impossible to:
 
 The leader schedule is already deterministically computed by every validator from
 epoch vote account stakes. This proposal simply makes that data available as
-account state.
+account state and via a syscall.
 
 ## New Terminology
 
@@ -47,7 +48,16 @@ leader identities and the slot-to-leader mapping for a single epoch.
 
 ## Detailed Design
 
-### Account Structure
+This proposal has two complementary parts:
+
+1. **On-chain accounts** for the full schedule (serves indexers and off-chain
+   consumers via account subscriptions)
+2. **A syscall** for efficient single-slot leader lookups (serves on-chain
+   programs without requiring them to load a ~280 KB account)
+
+### Part 1: Leader Schedule Accounts
+
+#### Account Structure
 
 Two accounts are maintained: one for the **current epoch** and one for the
 **next epoch**. Each account contains a self-describing binary layout with both
@@ -60,8 +70,8 @@ All multi-byte integers are little-endian.
 │ Header (16 bytes)                                   │
 │   epoch: u64            — epoch this schedule is for│
 │   num_leaders: u16      — unique leaders in table   │
-│   num_slot_blocks: u32  — slots_in_epoch / 4        │
-│   _reserved: [u8; 2]                                │
+│   num_slot_blocks: u32  — leader blocks in schedule │
+│   slots_per_block: u16  — slots per leader block    │
 ├─────────────────────────────────────────────────────┤
 │ Identity Table (num_leaders × 32 bytes)             │
 │   identities: [Pubkey; num_leaders]                 │
@@ -69,9 +79,15 @@ All multi-byte integers are little-endian.
 ├─────────────────────────────────────────────────────┤
 │ Schedule (num_slot_blocks × 2 bytes)                │
 │   leader_indices: [u16; num_slot_blocks]            │
-│   — index into Identity Table per 4-slot block      │
+│   — index into Identity Table per leader block      │
 └─────────────────────────────────────────────────────┘
 ```
+
+The `slots_per_block` field records how many consecutive slots are assigned to
+each leader (currently 4, i.e. `NUM_CONSECUTIVE_LEADER_SLOTS`). Consumers
+**must** read this field from the header rather than hardcoding the divisor.
+This ensures the format remains valid if the number of consecutive leader slots
+changes in a future consensus update (e.g. under Alpenglow).
 
 #### Size Analysis
 
@@ -96,16 +112,7 @@ within the 10 MB account data limit.
 `u16` limit of 65,535 unique validators provides substantial headroom — mainnet
 currently has ~2,000 validators in the leader schedule. If the network were to
 exceed 65,535 validators with non-zero stake, a future SIMD could introduce a
-new version with wider indices. The `_reserved` header bytes could be used for
-versioning.
-
-**Note on 4-slot block assumption:** The schedule stores one entry per 4-slot
-leader block, matching the current `NUM_CONSECUTIVE_LEADER_SLOTS` constant. If
-this constant were changed in a future consensus update, the binary format would
-need a corresponding version bump. The `_reserved` header bytes and the
-self-describing `num_slot_blocks` field provide forward-compatibility: consumers
-should derive the slot-to-block mapping from `num_slot_blocks` and
-`slots_in_epoch` rather than hardcoding the divisor.
+new version with wider indices.
 
 #### Vote Address Inclusion
 
@@ -121,7 +128,7 @@ bytes but enable direct cross-referencing without additional account lookups.
 Community feedback is welcome on whether the added utility justifies the size
 increase.
 
-### Account Addresses
+#### Account Addresses
 
 The two accounts live at well-known addresses derived as Program Derived
 Addresses (PDAs) from the owning program:
@@ -136,7 +143,7 @@ deterministic and verifiable. The seeds are fixed strings — the account
 **contents** rotate at epoch boundaries, not the addresses. This means indexers
 subscribe to exactly two stable addresses.
 
-### Owner Program
+#### Owner Program
 
 These accounts are owned by a new native program, the **Leader Schedule
 program**. This program:
@@ -146,9 +153,9 @@ program**. This program:
 - Serves only as the owner for the two leader schedule accounts
 - Is updated exclusively by the runtime at epoch boundaries
 
-### Runtime Behavior
+#### Runtime Behavior
 
-#### Epoch Boundary Update
+##### Epoch Boundary Update
 
 At each epoch boundary (when `parent.epoch() < new.epoch()`), the runtime:
 
@@ -166,7 +173,7 @@ This integrates into the existing epoch-boundary processing in
 `process_new_epoch()`, after vote account stake snapshots are taken and
 `update_epoch_stakes()` has been called.
 
-#### Feature Activation
+##### Feature Activation
 
 On the first epoch boundary after feature activation:
 
@@ -174,71 +181,75 @@ On the first epoch boundary after feature activation:
    since zero-lamport accounts are treated as non-existent by the runtime)
 2. `current_schedule` is populated with the current epoch's leader schedule
 3. `next_schedule` is populated with the next epoch's leader schedule, if vote
-   account stakes for that epoch are available. If not yet available (possible
-   at the very first epoch boundary after activation), it is populated with the
-   current epoch's schedule as a fallback and will be overwritten at the next
+   account stakes for that epoch are available. If not yet available, the
+   `next_schedule` account is left empty and will be populated at the next
    epoch boundary
 
-#### Consistency
+Consumers **must** check the `epoch` field in the header before using the
+account data.
+
+##### Consistency
 
 The leader schedule written to these accounts is identical to what
 `LeaderScheduleCache` computes and what `getLeaderSchedule` returns over RPC.
 The deterministic computation (ChaCha20 RNG seeded with epoch, stake-weighted
 sampling) is unchanged.
 
-### On-Chain Program Access
+#### On-Chain Program Access via Accounts
 
-Programs access the leader schedule by including the account as a read-only
-input to their instruction:
+Programs that need the full schedule (e.g. for analytics across many slots) can
+include the account as a read-only input to their instruction. The raw binary
+format enables zero-copy access — programs can index directly into the account
+data without deserialization overhead.
 
-```rust
-// Example: check who the leader is at a given slot
-fn get_leader_at_slot(
-    schedule_account: &AccountInfo,
-    target_slot: u64,
-    epoch_schedule: &EpochSchedule,
-) -> Result<Pubkey, ProgramError> {
-    let data = schedule_account.data.borrow();
+For programs that only need to check one or a few slots, the
+`sol_get_slot_leader` syscall (Part 2) is more efficient.
 
-    // Parse header
-    let epoch = u64::from_le_bytes(data[0..8].try_into().unwrap());
-    let num_leaders = u16::from_le_bytes(data[8..10].try_into().unwrap()) as usize;
-    let num_slot_blocks = u32::from_le_bytes(data[10..14].try_into().unwrap()) as usize;
+### Part 2: `sol_get_slot_leader` Syscall
 
-    // Compute slot block index within this epoch
-    let (slot_epoch, slot_index) = epoch_schedule.get_epoch_and_slot_index(target_slot);
-    if slot_epoch != epoch {
-        return Err(ProgramError::InvalidArgument);
-    }
-    let block_index = slot_index as usize / 4;
+#### Interface
 
-    // Look up leader index in schedule
-    let schedule_offset = 16 + (num_leaders * 32);
-    let idx_offset = schedule_offset + (block_index * 2);
-    let leader_idx = u16::from_le_bytes(
-        data[idx_offset..idx_offset + 2].try_into().unwrap()
-    ) as usize;
-
-    // Look up identity in table
-    let identity_offset = 16 + (leader_idx * 32);
-    let pubkey = Pubkey::try_from(&data[identity_offset..identity_offset + 32])
-        .map_err(|_| ProgramError::InvalidAccountData)?;
-
-    Ok(pubkey)
-}
+```
+u64 sol_get_slot_leader(
+    u64 slot,           // absolute slot number
+    u8 *leader_out,     // pointer to 32-byte output buffer
+)
 ```
 
-The raw binary format enables zero-copy access — programs can index directly
-into the account data without deserialization overhead.
+**Parameters:**
+- `slot`: The absolute slot number to query.
+- `leader_out`: Pointer to a 32-byte buffer where the leader identity pubkey
+  will be written.
+
+**Return value:**
+- `0` on success (leader pubkey written to `leader_out`)
+- `1` if the slot is outside the range covered by available schedule data
+  (current and next epoch)
+
+#### Compute Units
+
+```
+syscall_base + floor(32 / cpi_bytes_per_unit) + mem_op_base
+```
+
+With current defaults: `100 + floor(32/250) + 10 = 110` CU. This is
+comparable to other lightweight syscalls like `sol_get_epoch_stake`.
+
+#### Behavior
+
+The syscall reads from the validator's in-memory leader schedule (the same
+`LeaderScheduleCache` used by the RPC layer). It does **not** read from the
+on-chain accounts — the accounts serve the off-chain subscription use case,
+while the syscall serves the on-chain program use case.
+
+The syscall covers slots in the current and next epochs. Queries for slots
+outside this range return 1 (not found) without aborting the program.
 
 ### RPC
 
 No changes to existing RPC methods. The `getLeaderSchedule` and
 `getSlotLeaders` methods continue to work as before. Clients that prefer
 account-subscription-based access can use the new accounts.
-
-New RPC methods may be proposed in a follow-up SIMD if warranted, but are not
-part of this proposal.
 
 ## Alternatives Considered
 
@@ -262,15 +273,20 @@ goals (runtime-controlled, read-only, well-known addresses) without coupling to
 the sysvar cache infrastructure. Programs read the account data directly, just
 as they would any other account.
 
-### Syscall-Only Approach
+### Accounts-Only (No Syscall)
 
-A syscall like `sol_get_slot_leader(slot) -> Pubkey` would be more efficient
-for on-chain programs that only need to check individual slots. However:
+An earlier draft of this proposal relied solely on accounts for on-chain
+access. Loading a ~280 KB account into a transaction is expensive — it
+consumes a significant portion of the per-transaction account data budget and
+costs substantial compute units. Most on-chain use cases (checking a single
+slot's leader, gating execution) only need a single pubkey. The syscall
+provides this at ~110 CU instead of loading the full account.
 
-- It does not serve the off-chain subscription use case at all
-- It still requires the schedule to be computed and stored somewhere accessible
-  to the syscall handler
-- A syscall could be proposed as a complementary follow-up SIMD
+### Syscall-Only (No Accounts)
+
+A syscall alone would serve on-chain programs but would not serve the primary
+off-chain use case: indexers subscribing to schedule changes via Geyser plugins
+and websocket `accountSubscribe`. The accounts and syscall are complementary.
 
 ### Three Epochs (Last, Current, Next)
 
@@ -305,13 +321,20 @@ size to large existing accounts (programs, etc.) and well within the 10 MB
 limit. The combined footprint of ~560 KB for both accounts is modest relative
 to overall validator memory usage.
 
+### Capitalization Impact
+
+Creating these accounts at feature activation increases total capitalization by
+the rent-exempt minimum for ~560 KB of account data. At current rent parameters
+this is approximately 4 SOL. This is a one-time, small increase that occurs
+at the epoch boundary when the feature activates. No ongoing lamport changes
+occur beyond minor adjustments if account sizes change between epochs.
+
 ### Transaction Loading Cost
 
 Programs that load a leader schedule account will consume compute units
 proportional to the account data size (~280 KB). This is significant but
-comparable to loading other large accounts. Programs that only need to check a
-single slot's leader can optimize by reading only the relevant bytes using
-zero-copy access patterns.
+comparable to loading other large accounts. Most programs should prefer the
+`sol_get_slot_leader` syscall (~110 CU) over loading the full account.
 
 ### Read-Only Guarantees
 
@@ -330,14 +353,16 @@ Combined, these provide the same integrity guarantee as sysvar accounts.
 
 The leader schedule computation is deterministic (same epoch + same stakes =
 same schedule). All validators will produce identical account contents for the
-same epoch, ensuring consensus on account state.
+same epoch, ensuring consensus on account state. The syscall reads from the
+same deterministic computation.
 
 ## Backwards Compatibility
 
-This proposal introduces new accounts and a new native program. It does not
-modify any existing accounts, programs, sysvars, or RPC methods. There are no
-backwards compatibility concerns.
+This proposal introduces new accounts, a new native program, and a new syscall.
+It does not modify any existing accounts, programs, sysvars, or RPC methods.
+There are no backwards compatibility concerns.
 
 Validators that have not activated the feature will not create or update these
-accounts. Once the feature is activated network-wide, all validators will
-maintain consistent account state.
+accounts, and the syscall will not be available. Once the feature is activated
+network-wide, all validators will maintain consistent account state and expose
+the syscall.

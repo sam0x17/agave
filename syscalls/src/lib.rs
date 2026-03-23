@@ -308,6 +308,7 @@ pub fn create_program_runtime_environment(
         feature_set.remaining_compute_units_syscall_enabled;
     let get_sysvar_syscall_enabled = feature_set.get_sysvar_syscall_enabled;
     let enable_get_epoch_stake_syscall = feature_set.enable_get_epoch_stake_syscall;
+    let on_chain_leader_schedule = feature_set.on_chain_leader_schedule;
     let min_sbpf_version =
         if !feature_set.disable_sbpf_v0_execution || feature_set.reenable_sbpf_v0_execution {
             SBPFVersion::V0
@@ -519,6 +520,12 @@ pub fn create_program_runtime_environment(
         enable_get_epoch_stake_syscall,
         "sol_get_epoch_stake",
         SyscallGetEpochStake
+    )?;
+    register_feature_gated_function!(
+        result,
+        on_chain_leader_schedule,
+        "sol_get_slot_leader",
+        SyscallGetSlotLeader
     )?;
 
     // Log data
@@ -2636,6 +2643,52 @@ declare_builtin_function!(
             let vote_address = translate_type::<Pubkey>(memory_mapping, var_addr, check_aligned)?;
 
             Ok(invoke_context.get_epoch_stake_for_vote_account(vote_address))
+        }
+    }
+);
+
+declare_builtin_function!(
+    /// Get the leader identity for a given slot.
+    ///
+    /// Takes an absolute slot number and writes the 32-byte leader identity
+    /// pubkey to the output buffer. Returns 0 on success, 1 if the slot is
+    /// outside the range covered by available schedule data.
+    SyscallGetSlotLeader,
+    fn rust(
+        invoke_context: &mut InvokeContext<'_, '_>,
+        slot: u64,
+        output_addr: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let compute_cost = invoke_context.get_execution_cost();
+        // Cost: syscall_base + write 32 bytes
+        let compute_units = compute_cost
+            .syscall_base_cost
+            .saturating_add(
+                (PUBKEY_BYTES as u64)
+                    .checked_div(compute_cost.cpi_bytes_per_unit)
+                    .unwrap_or(u64::MAX),
+            )
+            .saturating_add(compute_cost.mem_op_base_cost);
+        consume_compute_meter(invoke_context, compute_units)?;
+
+        let leader = invoke_context.get_slot_leader(slot);
+
+        match leader {
+            Some(pubkey) => {
+                let check_aligned = invoke_context.get_check_aligned();
+                translate_mut!(
+                    memory_mapping,
+                    check_aligned,
+                    let output: &mut [u8] = map(output_addr, PUBKEY_BYTES as u64)?;
+                );
+                output.copy_from_slice(pubkey.as_ref());
+                Ok(0) // success
+            }
+            None => Ok(1), // slot not in available schedule range
         }
     }
 );
