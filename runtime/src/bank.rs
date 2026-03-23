@@ -6230,10 +6230,6 @@ impl InvokeContextCallback for Bank {
             .unwrap_or(0)
     }
 
-    fn get_slot_leader(&self, slot: Slot) -> Option<Pubkey> {
-        crate::leader_schedule_utils::slot_leader_at(slot, self)
-    }
-
     fn is_precompile(&self, program_id: &Pubkey) -> bool {
         is_precompile(program_id, |feature_id: &Pubkey| {
             self.feature_set.is_active(feature_id)

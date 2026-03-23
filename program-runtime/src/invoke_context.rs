@@ -711,13 +711,6 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             .get_epoch_stake_for_vote_account(pubkey)
     }
 
-    /// Get the leader identity for the given slot.
-    pub fn get_slot_leader(&self, slot: u64) -> Option<solana_pubkey::Pubkey> {
-        self.environment_config
-            .epoch_stake_callback
-            .get_slot_leader(slot)
-    }
-
     pub fn is_precompile(&self, pubkey: &Pubkey) -> bool {
         self.environment_config
             .epoch_stake_callback
