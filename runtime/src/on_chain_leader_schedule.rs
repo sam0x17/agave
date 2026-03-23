@@ -8,7 +8,7 @@ use {
     crate::bank::Bank,
     solana_account::AccountSharedData,
     solana_clock::Epoch,
-    solana_leader_schedule::{on_chain as format, NUM_CONSECUTIVE_LEADER_SLOTS},
+    solana_leader_schedule::{NUM_CONSECUTIVE_LEADER_SLOTS, on_chain as format},
     solana_pubkey::Pubkey,
     std::sync::LazyLock,
 };
@@ -24,10 +24,8 @@ pub static CURRENT_SCHEDULE_ADDR: LazyLock<Pubkey> = LazyLock::new(|| {
 
 /// PDA for the next epoch's leader schedule account.
 pub static NEXT_SCHEDULE_ADDR: LazyLock<Pubkey> = LazyLock::new(|| {
-    let (pubkey, _) = Pubkey::find_program_address(
-        &[b"next_schedule"],
-        &solana_leader_schedule_program::id(),
-    );
+    let (pubkey, _) =
+        Pubkey::find_program_address(&[b"next_schedule"], &solana_leader_schedule_program::id());
     pubkey
 });
 
@@ -54,27 +52,16 @@ fn write_schedule_account(bank: &Bank, epoch: Epoch, dest_addr: &Pubkey) {
     );
 
     // Extract identity pubkeys per slot for serialization.
-    let slot_leaders: Vec<Pubkey> = schedule
-        .get_slot_leaders()
-        .iter()
-        .map(|sl| sl.id)
-        .collect();
+    let slot_leaders: Vec<Pubkey> = schedule.get_slot_leaders().iter().map(|sl| sl.id).collect();
 
-    let data = format::serialize_leader_schedule(
-        &slot_leaders,
-        epoch,
-        slots_per_block.get(),
-    );
+    let data = format::serialize_leader_schedule(&slot_leaders, epoch, slots_per_block.get());
     let lamports = bank
         .rent_collector()
         .rent
         .minimum_balance(data.len())
         .max(1);
-    let mut account = AccountSharedData::new(
-        lamports,
-        data.len(),
-        &solana_leader_schedule_program::id(),
-    );
+    let mut account =
+        AccountSharedData::new(lamports, data.len(), &solana_leader_schedule_program::id());
     account.set_data_from_slice(&data);
     bank.store_account_and_update_capitalization(dest_addr, &account);
 }
@@ -100,10 +87,7 @@ pub(crate) fn update_on_chain_leader_schedule(bank: &Bank) {
     } else {
         // Rotate: copy next -> current (if next exists), then compute new next.
         if let Some(next_account) = bank.get_account(&NEXT_SCHEDULE_ADDR) {
-            bank.store_account_and_update_capitalization(
-                &CURRENT_SCHEDULE_ADDR,
-                &next_account,
-            );
+            bank.store_account_and_update_capitalization(&CURRENT_SCHEDULE_ADDR, &next_account);
         } else {
             // next_schedule wasn't populated yet (edge case after bootstrap
             // when next epoch data wasn't available). Compute current directly.
@@ -135,8 +119,7 @@ mod tests {
         use solana_pubkey::Pubkey;
         let current_expected =
             Pubkey::from_str_const("7yJfSmGSR1m4Xy6JVvxufauQWo7oEqrHVsjWiAS8hSpD");
-        let next_expected =
-            Pubkey::from_str_const("9RXx9Z8EcmAnv3LMHk8GLzM5wsyUT8G4YoVfiqsURGMN");
+        let next_expected = Pubkey::from_str_const("9RXx9Z8EcmAnv3LMHk8GLzM5wsyUT8G4YoVfiqsURGMN");
         assert_eq!(*CURRENT_SCHEDULE_ADDR, current_expected);
         assert_eq!(*NEXT_SCHEDULE_ADDR, next_expected);
     }
@@ -168,7 +151,10 @@ mod tests {
         assert_eq!(header.epoch, epoch);
         assert!(header.num_leaders > 0);
         assert!(header.num_slot_blocks > 0);
-        assert_eq!(header.slots_per_block, NUM_CONSECUTIVE_LEADER_SLOTS.get() as u16);
+        assert_eq!(
+            header.slots_per_block,
+            NUM_CONSECUTIVE_LEADER_SLOTS.get() as u16
+        );
 
         // The sole leader should be leader_pubkey.
         let leader = get_leader_at_block(current.data(), 0).unwrap();
@@ -216,8 +202,7 @@ mod tests {
         let epoch = bank.epoch();
 
         // Compute via leader_schedule_utils (same path as LeaderScheduleCache).
-        let canonical_schedule =
-            leader_schedule_utils::leader_schedule(epoch, &bank).unwrap();
+        let canonical_schedule = leader_schedule_utils::leader_schedule(epoch, &bank).unwrap();
 
         // Compute via on-chain serialization.
         update_on_chain_leader_schedule(&bank);
@@ -227,8 +212,7 @@ mod tests {
         // Verify every slot block matches.
         for block_idx in 0..header.num_slot_blocks as usize {
             let slot_idx = block_idx * header.slots_per_block as usize;
-            let on_chain_leader =
-                get_leader_at_block(current.data(), block_idx).unwrap();
+            let on_chain_leader = get_leader_at_block(current.data(), block_idx).unwrap();
             let canonical_leader = canonical_schedule[slot_idx as u64].id;
             assert_eq!(
                 on_chain_leader, canonical_leader,

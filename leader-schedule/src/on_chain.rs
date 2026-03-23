@@ -23,11 +23,7 @@
 //! └─────────────────────────────────────────────────────┘
 //! ```
 
-use {
-    solana_clock::Epoch,
-    solana_pubkey::Pubkey,
-    std::collections::HashMap,
-};
+use {solana_clock::Epoch, solana_pubkey::Pubkey, std::collections::HashMap};
 
 /// Current format version.
 pub const VERSION: u32 = 1;
@@ -67,9 +63,8 @@ pub fn serialize_leader_schedule(
     let num_slot_blocks = slot_leaders.len().div_ceil(slots_per_block);
     let num_leaders = unique_identities.len();
 
-    let data_len = HEADER_SIZE
-        + num_leaders * IDENTITY_SIZE
-        + num_slot_blocks * SCHEDULE_INDEX_SIZE;
+    let data_len =
+        HEADER_SIZE + num_leaders * IDENTITY_SIZE + num_slot_blocks * SCHEDULE_INDEX_SIZE;
     let mut data = vec![0u8; data_len];
 
     // Write header.
@@ -158,9 +153,11 @@ pub fn get_leader_at_block(data: &[u8], block_index: usize) -> Option<Pubkey> {
 
     let schedule_start = HEADER_SIZE + header.num_leaders as usize * IDENTITY_SIZE;
     let idx_offset = schedule_start + block_index * SCHEDULE_INDEX_SIZE;
-    let leader_idx =
-        u16::from_le_bytes(data[idx_offset..idx_offset + SCHEDULE_INDEX_SIZE].try_into().ok()?)
-            as usize;
+    let leader_idx = u16::from_le_bytes(
+        data[idx_offset..idx_offset + SCHEDULE_INDEX_SIZE]
+            .try_into()
+            .ok()?,
+    ) as usize;
 
     if leader_idx >= header.num_leaders as usize {
         return None;
@@ -188,9 +185,8 @@ pub fn get_identities(data: &[u8]) -> Option<Vec<Pubkey>> {
     let mut identities = Vec::with_capacity(header.num_leaders as usize);
     for i in 0..header.num_leaders as usize {
         let offset = HEADER_SIZE + i * IDENTITY_SIZE;
-        let pubkey = Pubkey::from(
-            <[u8; 32]>::try_from(&data[offset..offset + IDENTITY_SIZE]).ok()?,
-        );
+        let pubkey =
+            Pubkey::from(<[u8; 32]>::try_from(&data[offset..offset + IDENTITY_SIZE]).ok()?);
         identities.push(pubkey);
     }
     Some(identities)
@@ -299,9 +295,8 @@ mod tests {
         let slots_per_epoch = 432_000;
         let num_blocks = slots_per_epoch / SLOTS_PER_BLOCK;
 
-        let expected_size = HEADER_SIZE
-            + num_validators * IDENTITY_SIZE
-            + num_blocks * SCHEDULE_INDEX_SIZE;
+        let expected_size =
+            HEADER_SIZE + num_validators * IDENTITY_SIZE + num_blocks * SCHEDULE_INDEX_SIZE;
 
         // 20 + 64000 + 216000 = 280020 bytes ≈ 273 KB
         assert_eq!(expected_size, 280_020);
