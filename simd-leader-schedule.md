@@ -99,6 +99,14 @@ exceed 65,535 validators with non-zero stake, a future SIMD could introduce a
 new version with wider indices. The `_reserved` header bytes could be used for
 versioning.
 
+**Note on 4-slot block assumption:** The schedule stores one entry per 4-slot
+leader block, matching the current `NUM_CONSECUTIVE_LEADER_SLOTS` constant. If
+this constant were changed in a future consensus update, the binary format would
+need a corresponding version bump. The `_reserved` header bytes and the
+self-describing `num_slot_blocks` field provide forward-compatibility: consumers
+should derive the slot-to-block mapping from `num_slot_blocks` and
+`slots_in_epoch` rather than hardcoding the divisor.
+
 #### Vote Address Inclusion
 
 This proposal stores only validator identity pubkeys in the Identity Table, not
@@ -307,9 +315,16 @@ zero-copy access patterns.
 
 ### Read-Only Guarantees
 
-The accounts are owned by a native program that rejects all instructions. They
-cannot be modified by any transaction — only by the runtime at epoch boundaries.
-This provides the same integrity guarantee as sysvar accounts.
+The accounts are protected by two independent mechanisms:
+
+1. **Program-level:** The owning native program rejects all instructions, so no
+   transaction can modify the accounts through program invocation.
+2. **Transaction-level:** The program ID and both PDA addresses are added to the
+   reserved account keys list (gated on the same feature). This prevents any
+   transaction from acquiring a write lock on these accounts, even if a
+   malicious program were to claim ownership.
+
+Combined, these provide the same integrity guarantee as sysvar accounts.
 
 ### Determinism
 
