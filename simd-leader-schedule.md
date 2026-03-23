@@ -2,7 +2,7 @@
 simd: 'XXXX'
 title: On-Chain Leader Schedule
 authors:
-  - Sam (Anza)
+  - sam0x17 (Anza)
 category: Standard
 type: Core
 status: Draft
