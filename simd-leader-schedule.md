@@ -101,20 +101,6 @@ currently has ~2,000 validators in the leader schedule. If the network were to
 exceed 65,535 validators with non-zero stake, a future SIMD could introduce a
 new version with wider indices.
 
-### Vote Address Inclusion
-
-This proposal stores only validator identity pubkeys in the Identity Table, not
-vote account addresses. Including vote addresses would double the identity table
-size (~128 KB for 2,000 validators) and provide marginal benefit since vote
-accounts are already queryable on-chain by their address. Programs needing to
-map identity → vote account can perform that lookup separately.
-
-**Open question:** Should vote addresses be included in the Identity Table
-alongside identity pubkeys? This would increase the per-identity entry to 64
-bytes but enable direct cross-referencing without additional account lookups.
-Community feedback is welcome on whether the added utility justifies the size
-increase.
-
 ### Account Addresses
 
 The two accounts live at well-known addresses derived as Program Derived
@@ -235,6 +221,15 @@ retrospective analytics. Two epochs (current + next) were chosen instead because
 Storing both epochs in one account would halve the number of accounts but
 roughly double the account size. Separate accounts allow programs to load only
 the epoch they need, reducing per-transaction account data.
+
+### Including Vote Addresses in Identity Table
+
+The Identity Table stores only validator identity pubkeys. An alternative is to
+include vote account addresses alongside each identity, doubling the per-entry
+size to 64 bytes (~128 KB for 2,000 validators). This was not included because
+vote accounts are already queryable on-chain by their address, and programs
+needing the mapping can perform that lookup separately. Community feedback is
+welcome on whether the added utility would justify the size increase.
 
 ### u32 Indices
 
