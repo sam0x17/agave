@@ -202,6 +202,22 @@ goals (runtime-controlled, read-only, well-known addresses) without coupling to
 the sysvar cache infrastructure. Programs read the account data directly, just
 as they would any other account.
 
+### Geyser Plugin Interface
+
+The Geyser plugin interface could be extended to emit leader schedule data
+directly at epoch boundaries, without storing it in an account. However, Geyser
+is a push-only interface: plugins receive notifications but cannot query the
+validator for data on demand. A consumer that starts mid-epoch, reconnects after
+a disconnect, or simply needs the current schedule at an arbitrary point in time
+would have no way to retrieve it without maintaining its own state from the
+stream origin.
+
+Storing the schedule in an account solves this naturally. Any consumer can read
+the account at any time via the existing accounts infrastructure (snapshots,
+`getAccountInfo`, Geyser account notifications). This also avoids adding
+request-response semantics to Geyser, which would conflict with the ongoing
+effort to decouple RPC-adjacent functionality from the validator.
+
 ### Syscall
 
 A syscall like `sol_get_slot_leader(slot) -> Pubkey` would be more efficient
