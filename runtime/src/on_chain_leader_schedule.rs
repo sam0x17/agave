@@ -33,9 +33,8 @@ pub static NEXT_SCHEDULE_ADDR: LazyLock<Pubkey> = LazyLock::new(|| {
 
 /// Compute and store the leader schedule for a given epoch into `dest_addr`.
 fn write_schedule_account(bank: &Bank, epoch: Epoch, dest_addr: &Pubkey) {
-    let vote_accounts = match bank.epoch_vote_accounts(epoch) {
-        Some(va) => va,
-        None => return,
+    let Some(vote_accounts) = bank.epoch_vote_accounts(epoch) else {
+        return;
     };
 
     let slots_in_epoch: usize = bank
@@ -89,7 +88,7 @@ pub(crate) fn update_on_chain_leader_schedule(bank: &Bank) {
     let current_epoch = bank.epoch();
     let next_epoch = current_epoch + 1;
 
-    let is_bootstrap = bank.get_account(&*CURRENT_SCHEDULE_ADDR).is_none();
+    let is_bootstrap = bank.get_account(&CURRENT_SCHEDULE_ADDR).is_none();
 
     if is_bootstrap {
         // First activation: populate current. Only populate next if
@@ -100,7 +99,7 @@ pub(crate) fn update_on_chain_leader_schedule(bank: &Bank) {
         }
     } else {
         // Rotate: copy next -> current (if next exists), then compute new next.
-        if let Some(next_account) = bank.get_account(&*NEXT_SCHEDULE_ADDR) {
+        if let Some(next_account) = bank.get_account(&NEXT_SCHEDULE_ADDR) {
             bank.store_account_and_update_capitalization(
                 &CURRENT_SCHEDULE_ADDR,
                 &next_account,
@@ -162,7 +161,7 @@ mod tests {
 
         // Current account should exist.
         let current = bank
-            .get_account(&*CURRENT_SCHEDULE_ADDR)
+            .get_account(&CURRENT_SCHEDULE_ADDR)
             .expect("current schedule account should exist after bootstrap");
 
         let header = deserialize_header(current.data()).unwrap();
@@ -198,7 +197,7 @@ mod tests {
         update_on_chain_leader_schedule(&bank);
 
         // After rotation, current should still be valid.
-        let current = bank.get_account(&*CURRENT_SCHEDULE_ADDR).unwrap();
+        let current = bank.get_account(&CURRENT_SCHEDULE_ADDR).unwrap();
         assert!(deserialize_header(current.data()).is_some());
     }
 
@@ -222,7 +221,7 @@ mod tests {
 
         // Compute via on-chain serialization.
         update_on_chain_leader_schedule(&bank);
-        let current = bank.get_account(&*CURRENT_SCHEDULE_ADDR).unwrap();
+        let current = bank.get_account(&CURRENT_SCHEDULE_ADDR).unwrap();
         let header = deserialize_header(current.data()).unwrap();
 
         // Verify every slot block matches.

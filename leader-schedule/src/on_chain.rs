@@ -53,7 +53,7 @@ pub fn serialize_leader_schedule(
     slots_per_block: usize,
 ) -> Vec<u8> {
     // Build sorted, deduplicated identity table and index map.
-    let mut unique_identities: Vec<Pubkey> = slot_leaders.iter().copied().collect();
+    let mut unique_identities: Vec<Pubkey> = slot_leaders.to_vec();
     unique_identities.sort();
     unique_identities.dedup();
 
@@ -64,7 +64,7 @@ pub fn serialize_leader_schedule(
         .collect();
 
     // One entry per leader block.
-    let num_slot_blocks = (slot_leaders.len() + slots_per_block - 1) / slots_per_block;
+    let num_slot_blocks = slot_leaders.len().div_ceil(slots_per_block);
     let num_leaders = unique_identities.len();
 
     let data_len = HEADER_SIZE
