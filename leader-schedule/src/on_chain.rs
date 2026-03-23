@@ -8,7 +8,8 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────┐
-//! │ Header (16 bytes)                                   │
+//! │ Header (20 bytes)                                   │
+//! │   version: u32          — format version (1)        │
 //! │   epoch: u64                                        │
 //! │   num_leaders: u16                                  │
 //! │   num_slot_blocks: u32                              │
@@ -28,8 +29,11 @@ use {
     std::collections::HashMap,
 };
 
+/// Current format version.
+pub const VERSION: u32 = 1;
+
 /// Size of the fixed header in bytes.
-pub const HEADER_SIZE: usize = 16;
+pub const HEADER_SIZE: usize = 20;
 
 /// Size of one identity entry (a single Pubkey).
 pub const IDENTITY_SIZE: usize = 32;
@@ -69,10 +73,11 @@ pub fn serialize_leader_schedule(
     let mut data = vec![0u8; data_len];
 
     // Write header.
-    data[0..8].copy_from_slice(&epoch.to_le_bytes());
-    data[8..10].copy_from_slice(&(num_leaders as u16).to_le_bytes());
-    data[10..14].copy_from_slice(&(num_slot_blocks as u32).to_le_bytes());
-    data[14..16].copy_from_slice(&(slots_per_block as u16).to_le_bytes());
+    data[0..4].copy_from_slice(&VERSION.to_le_bytes());
+    data[4..12].copy_from_slice(&epoch.to_le_bytes());
+    data[12..14].copy_from_slice(&(num_leaders as u16).to_le_bytes());
+    data[14..18].copy_from_slice(&(num_slot_blocks as u32).to_le_bytes());
+    data[18..20].copy_from_slice(&(slots_per_block as u16).to_le_bytes());
 
     // Write identity table.
     let identities_start = HEADER_SIZE;
@@ -97,6 +102,7 @@ pub fn serialize_leader_schedule(
 /// Deserialized header from an on-chain leader schedule account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaderScheduleHeader {
+    pub version: u32,
     pub epoch: Epoch,
     pub num_leaders: u16,
     pub num_slot_blocks: u32,
@@ -104,14 +110,21 @@ pub struct LeaderScheduleHeader {
 }
 
 /// Deserialize the header from raw account data.
+///
+/// Returns `None` if the data is too short, the version is unsupported,
+/// or the declared sizes exceed the available data.
 pub fn deserialize_header(data: &[u8]) -> Option<LeaderScheduleHeader> {
     if data.len() < HEADER_SIZE {
         return None;
     }
-    let epoch = u64::from_le_bytes(data[0..8].try_into().ok()?);
-    let num_leaders = u16::from_le_bytes(data[8..10].try_into().ok()?);
-    let num_slot_blocks = u32::from_le_bytes(data[10..14].try_into().ok()?);
-    let slots_per_block = u16::from_le_bytes(data[14..16].try_into().ok()?);
+    let version = u32::from_le_bytes(data[0..4].try_into().ok()?);
+    if version != VERSION {
+        return None;
+    }
+    let epoch = u64::from_le_bytes(data[4..12].try_into().ok()?);
+    let num_leaders = u16::from_le_bytes(data[12..14].try_into().ok()?);
+    let num_slot_blocks = u32::from_le_bytes(data[14..18].try_into().ok()?);
+    let slots_per_block = u16::from_le_bytes(data[18..20].try_into().ok()?);
 
     if slots_per_block == 0 {
         return None;
@@ -125,6 +138,7 @@ pub fn deserialize_header(data: &[u8]) -> Option<LeaderScheduleHeader> {
     }
 
     Some(LeaderScheduleHeader {
+        version,
         epoch,
         num_leaders,
         num_slot_blocks,
@@ -206,6 +220,7 @@ mod tests {
         let data = serialize_leader_schedule(&slot_leaders, epoch, SLOTS_PER_BLOCK);
 
         let header = deserialize_header(&data).unwrap();
+        assert_eq!(header.version, VERSION);
         assert_eq!(header.epoch, epoch);
         assert_eq!(header.num_leaders, 3);
         assert_eq!(header.num_slot_blocks, 3);
@@ -268,6 +283,17 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_version_returns_none() {
+        let leader = Pubkey::new_unique();
+        let slot_leaders = vec![leader; 4];
+        let mut data = serialize_leader_schedule(&slot_leaders, 0, SLOTS_PER_BLOCK);
+
+        // Overwrite version to 99
+        data[0..4].copy_from_slice(&99u32.to_le_bytes());
+        assert!(deserialize_header(&data).is_none());
+    }
+
+    #[test]
     fn test_account_size_mainnet_scale() {
         let num_validators = 2000;
         let slots_per_epoch = 432_000;
@@ -277,8 +303,8 @@ mod tests {
             + num_validators * IDENTITY_SIZE
             + num_blocks * SCHEDULE_INDEX_SIZE;
 
-        // 16 + 64000 + 216000 = 280016 bytes ≈ 273 KB
-        assert_eq!(expected_size, 280_016);
+        // 20 + 64000 + 216000 = 280020 bytes ≈ 273 KB
+        assert_eq!(expected_size, 280_020);
         assert!(expected_size < 10 * 1024 * 1024); // well under 10MB limit
     }
 

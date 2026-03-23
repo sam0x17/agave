@@ -54,7 +54,8 @@ All multi-byte integers are little-endian.
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│ Header (16 bytes)                                   │
+│ Header (20 bytes)                                   │
+│   version: u32          — format version (currently 1)
 │   epoch: u64            — epoch this schedule is for│
 │   num_leaders: u16      — unique leaders in table   │
 │   num_slot_blocks: u32  — leader blocks in schedule │
@@ -70,6 +71,11 @@ All multi-byte integers are little-endian.
 └─────────────────────────────────────────────────────┘
 ```
 
+The `version` field enables clients to detect incompatible format changes and
+fail gracefully rather than silently misparse account data. This proposal
+defines version 1. Future SIMDs that alter the layout (e.g. wider indices,
+vote address inclusion) would increment the version.
+
 The `slots_per_block` field records how many consecutive slots are assigned to
 each leader (currently 4, i.e. `NUM_CONSECUTIVE_LEADER_SLOTS`). Consumers
 **must** read this field from the header rather than hardcoding the divisor.
@@ -82,7 +88,7 @@ With mainnet parameters (432,000 slots/epoch, ~2,000 active validators):
 
 | Component | Calculation | Size |
 |-----------|------------|------|
-| Header | fixed | 16 bytes |
+| Header | fixed | 20 bytes |
 | Identity Table | 2,000 × 32 bytes | 64 KB |
 | Schedule | 108,000 × 2 bytes | 216 KB |
 | **Total per account** | | **~280 KB** |
