@@ -20,7 +20,7 @@ pub use vote_keyed::LeaderSchedule;
 /// advances to the next validator.
 pub const NUM_CONSECUTIVE_LEADER_SLOTS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
-#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash)]
 pub struct SlotLeader {
     pub id: Pubkey,
     pub vote_address: Pubkey,

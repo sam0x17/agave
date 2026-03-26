@@ -12,9 +12,10 @@ feature: (fill in with feature tracking issues once accepted)
 
 ## Summary
 
-Store the leader schedule for the current and upcoming epochs in on-chain
-accounts, enabling downstream consumers to subscribe to account updates for
-real-time schedule delivery.
+Store the leader schedule for the previous, current, and next epochs in
+on-chain accounts, enabling downstream consumers to subscribe to account
+updates for real-time schedule delivery and permissionless on-chain skip rate
+computation.
 
 ## Motivation
 
@@ -27,10 +28,17 @@ and unnecessary load. With the schedule stored in on-chain accounts, Geyser
 plugins and websocket `accountSubscribe` calls can deliver schedule updates in
 real time at epoch boundaries.
 
-**For off-chain analytics:** Validator skip rates require correlating the slot
-history with the leader schedule. Today this requires off-chain RPC polling. With
-the schedule in an account, analytics pipelines can subscribe to both the slot
-history sysvar and the leader schedule account for a fully reactive approach.
+**For skip rate computation:** Validator skip rates require correlating the slot
+history with the leader schedule. Today this requires off-chain RPC polling.
+With the schedule available on-chain (including the previous epoch), a
+permissionless crank program can compute skip rates entirely on-chain by
+combining the leader schedule account with the slot history sysvar. This
+enables fully on-chain stake delegation strategies based on validator
+performance, without relying on off-chain oracles.
+
+**For off-chain analytics:** Analytics pipelines can subscribe to the leader
+schedule accounts and the slot history sysvar for a fully reactive approach to
+performance monitoring, without polling RPC endpoints.
 
 The leader schedule is already deterministically computed by every validator from
 epoch vote account stakes. This proposal simply makes that data available as
@@ -39,48 +47,64 @@ account state.
 ## New Terminology
 
 **Leader schedule account:** A system-managed account (not a sysvar — see
-[Alternatives Considered](#alternatives-considered)) that stores both the unique
-leader identities and the slot-to-leader mapping for a single epoch.
+[Alternatives Considered](#alternatives-considered)) that stores the unique
+leader identity/vote-account pairs and the slot-to-leader mapping for a single
+epoch.
+
+**Leader span:** A contiguous group of slots assigned to a single leader
+(currently 4 slots, i.e. `NUM_CONSECUTIVE_LEADER_SLOTS`). The schedule is
+indexed by leader span rather than by individual slot.
 
 ## Detailed Design
 
 ### Account Structure
 
-Two accounts are maintained: one for the **current epoch** and one for the
-**next epoch**. Each account contains a self-describing binary layout with both
-the identity table and the schedule index array.
+Three accounts are maintained: one for the **previous epoch**, one for the
+**current epoch**, and one for the **next epoch**. Each account contains a
+self-describing binary layout with the identity table (including vote
+addresses) and the schedule index array.
 
-All multi-byte integers are little-endian.
+All multi-byte integers are little-endian. The binary layout is **packed** with
+no alignment padding between fields.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│ Header (20 bytes)                                   │
-│   version: u32          — format version (currently 1)
-│   epoch: u64            — epoch this schedule is for│
-│   num_leaders: u16      — unique leaders in table   │
-│   num_slot_blocks: u32  — leader blocks in schedule │
-│   slots_per_block: u16  — slots per leader block    │
-├─────────────────────────────────────────────────────┤
-│ Identity Table (num_leaders × 32 bytes)             │
-│   identities: [Pubkey; num_leaders]                 │
-│   — validator identity keys, sorted by byte order   │
-├─────────────────────────────────────────────────────┤
-│ Schedule (num_slot_blocks × 2 bytes)                │
-│   leader_indices: [u16; num_slot_blocks]            │
-│   — index into Identity Table per leader block      │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│ Header (18 bytes, packed)                             │
+│   version: u16          — format version (currently 1)│
+│   epoch: u64            — epoch this schedule is for  │
+│   num_leaders: u16      — unique entries in table     │
+│   num_leader_spans: u32 — leader spans in schedule    │
+│   slots_per_span: u16   — slots per leader span       │
+├───────────────────────────────────────────────────────┤
+│ Identity Table (num_leaders × 64 bytes)               │
+│   entries: [(Pubkey, Pubkey); num_leaders]            │
+│   — (validator identity, vote account) pairs,         │
+│     sorted by identity key byte order                 │
+├───────────────────────────────────────────────────────┤
+│ Schedule (num_leader_spans × 2 bytes)                 │
+│   leader_indices: [u16; num_leader_spans]             │
+│   — index into Identity Table per leader span         │
+└───────────────────────────────────────────────────────┘
 ```
 
-The `version` field enables clients to detect incompatible format changes and
-fail gracefully rather than silently misparse account data. This proposal
-defines version 1. Future SIMDs that alter the layout (e.g. wider indices,
-vote address inclusion) would increment the version.
+The `version` field is the first field in the header, enabling clients to read
+the first two bytes to detect incompatible format changes and fail gracefully
+rather than silently misparse account data. This proposal defines version 1.
+Future SIMDs that alter the layout (e.g. wider indices, additional fields)
+would increment the version.
 
-The `slots_per_block` field records how many consecutive slots are assigned to
-each leader (currently 4, i.e. `NUM_CONSECUTIVE_LEADER_SLOTS`). Consumers
-**must** read this field from the header rather than hardcoding the divisor.
-This ensures the format remains valid if the number of consecutive leader slots
-changes in a future consensus update (e.g. under Alpenglow).
+A **leader span** refers to a group of consecutive slots assigned to a single
+leader. The `slots_per_span` field records how many slots comprise each span
+(currently 4, i.e. `NUM_CONSECUTIVE_LEADER_SLOTS`). Consumers **must** read
+this field from the header rather than hardcoding the divisor. This ensures
+the format remains valid if the number of consecutive leader slots changes in
+a future consensus update (e.g. under Alpenglow).
+
+Each entry in the Identity Table is a 64-byte pair of `(identity, vote_account)`.
+A single validator identity may appear in multiple entries if it operates
+multiple vote accounts, since leader slots are assigned per vote account stake.
+This enables per-vote-account skip rate computation, which is required for
+accurate validator performance analysis and stake delegation decisions.
 
 ### Size Analysis
 
@@ -88,48 +112,53 @@ With mainnet parameters (432,000 slots/epoch, ~2,000 active validators):
 
 | Component | Calculation | Size |
 |-----------|------------|------|
-| Header | fixed | 20 bytes |
-| Identity Table | 2,000 × 32 bytes | 64 KB |
+| Header | fixed | 18 bytes |
+| Identity Table | 2,000 × 64 bytes | 128 KB |
 | Schedule | 108,000 × 2 bytes | 216 KB |
-| **Total per account** | | **~280 KB** |
-| **Total (2 accounts)** | | **~560 KB** |
+| **Total per account** | | **~344 KB** |
+| **Total (3 accounts)** | | **~1.03 MB** |
 
-The maximum identity table size occurs when stake is distributed equally across
-the maximum number of validators. With `u16` indices, the identity table
-supports up to 65,535 unique leaders. At 65,535 leaders × 32 bytes = 2 MB for
-the identity table alone. The theoretical maximum account size is ~2.2 MB, well
-within the 10 MB account data limit.
+The identity table uses 64 bytes per entry (32-byte identity + 32-byte vote
+account). Note that `num_leaders` may exceed the number of unique validator
+identities if any identity operates multiple vote accounts.
+
+With `u16` indices, the identity table supports up to 65,535 unique entries.
+At 65,535 entries × 64 bytes = 4 MB for the identity table alone. The
+theoretical maximum account size is ~4.2 MB, well within the 10 MB account
+data limit. With Alpenglow's cap of 2,000 voting validators, the practical
+maximum is well below this.
 
 **Note on index width:** This proposal uses `u16` indices (2 bytes) rather than
 `u32` (4 bytes), saving 216 KB per account at current mainnet parameters. The
-`u16` limit of 65,535 unique validators provides substantial headroom — mainnet
-currently has ~2,000 validators in the leader schedule. If the network were to
-exceed 65,535 validators with non-zero stake, a future SIMD could introduce a
-new version with wider indices.
+`u16` limit of 65,535 entries provides substantial headroom. If the network
+were to exceed this limit, a future SIMD could introduce a new version with
+wider indices.
 
 ### Account Addresses
 
-The two accounts live at well-known addresses derived as Program Derived
+The three accounts live at well-known addresses derived as Program Derived
 Addresses (PDAs) from the owning program:
 
 ```
-current_schedule = PDA(leader_schedule_program_id, ["current_schedule"])
-next_schedule    = PDA(leader_schedule_program_id, ["next_schedule"])
+previous_schedule = PDA(leader_schedule_program_id, ["previous_schedule"])
+current_schedule  = PDA(leader_schedule_program_id, ["current_schedule"])
+next_schedule     = PDA(leader_schedule_program_id, ["next_schedule"])
 ```
 
 Using PDAs rather than vanity-ground addresses ensures the addresses are
 deterministic and verifiable. The seeds are fixed strings — the account
-**contents** rotate at epoch boundaries, not the addresses. This means indexers
-subscribe to exactly two stable addresses.
+**contents** rotate at epoch boundaries, not the addresses. This means
+consumers subscribe to exactly three stable addresses.
 
 ### Owner Program
 
 These accounts are owned by a new native program, the **Leader Schedule
-program**. This program:
+program**, with program ID `TBD` (to be derived/assigned before this SIMD is
+finalized). This program:
 
 - Rejects all instructions (the accounts are read-only from the perspective of
   transactions)
-- Serves only as the owner for the two leader schedule accounts
+- Serves only as the owner for the three leader schedule accounts
 - Is updated exclusively by the runtime at epoch boundaries
 
 ### Runtime Behavior
@@ -138,12 +167,13 @@ program**. This program:
 
 At each epoch boundary (when `parent.epoch() < new.epoch()`), the runtime:
 
-1. Copies the contents of `next_schedule` into `current_schedule`
-2. Computes the leader schedule for `current_epoch + 1` using the same
+1. Copies the contents of `current_schedule` into `previous_schedule`
+2. Copies the contents of `next_schedule` into `current_schedule`
+3. Computes the leader schedule for `current_epoch + 1` using the same
    stake-weighted shuffle (`LeaderSchedule::new()`) that already populates the
    `LeaderScheduleCache`
-3. Serializes the new schedule into the binary format described above
-4. Writes the result to `next_schedule`
+4. Serializes the new schedule into the binary format described above
+5. Writes the result to `next_schedule`
 
 Account lamport balances are set to the rent-exempt minimum (or 1 lamport,
 whichever is greater) on each write.
@@ -156,16 +186,19 @@ This integrates into the existing epoch-boundary processing in
 
 On the first epoch boundary after feature activation:
 
-1. Both accounts are created with the rent-exempt balance (minimum 1 lamport,
-   since zero-lamport accounts are treated as non-existent by the runtime)
-2. `current_schedule` is populated with the current epoch's leader schedule
-3. `next_schedule` is populated with the next epoch's leader schedule, if vote
+1. All three accounts are created with the rent-exempt balance (minimum 1
+   lamport, since zero-lamport accounts are treated as non-existent by the
+   runtime)
+2. `previous_schedule` is left empty (no prior epoch data is available)
+3. `current_schedule` is populated with the current epoch's leader schedule
+4. `next_schedule` is populated with the next epoch's leader schedule, if vote
    account stakes for that epoch are available. If not yet available, the
    `next_schedule` account is left empty and will be populated at the next
    epoch boundary
 
 Consumers **must** check the `epoch` field in the header before using the
-account data.
+account data. An empty account (zero data length) indicates that no schedule
+is available for that slot yet.
 
 #### Consistency
 
@@ -176,9 +209,15 @@ sampling) is unchanged.
 
 ### RPC
 
-No changes to existing RPC methods. The `getLeaderSchedule` and
-`getSlotLeaders` methods continue to work as before. Clients that prefer
-account-subscription-based access can use the new accounts.
+No changes to existing RPC methods are required by this proposal. The
+`getLeaderSchedule` and `getSlotLeaders` methods continue to work as before.
+
+However, once the leader schedule is available as account data, the existing
+RPC endpoints become redundant. Client libraries could implement
+`getLeaderSchedule` as client-side account reads and deserialization rather
+than dedicated RPC calls. This opens a path toward eventually deprecating
+these endpoints, consistent with the broader goal of reducing
+validator-specific RPC surface area.
 
 ## Alternatives Considered
 
@@ -227,16 +266,14 @@ is from off-chain consumers who need subscription-based access. A syscall could
 be proposed in a follow-up SIMD if on-chain demand materializes; the runtime
 already has the data structures to support it.
 
-### Three Epochs (Last, Current, Next)
+### Two Epochs (Current, Next)
 
-An earlier draft of this proposal included the previous epoch's schedule for
-retrospective analytics. Two epochs (current + next) were chosen instead because:
-
-- Off-chain consumers can retain historical schedule data by subscribing to
-  account updates and storing snapshots
-- The slot history sysvar already provides skip information; combining it with
-  a saved schedule snapshot is straightforward
-- Fewer accounts means less state and simpler rotation logic
+An earlier draft of this proposal used only two accounts (current + next). Three
+epochs were chosen instead because the previous epoch's schedule is required
+for permissionless on-chain skip rate computation. Without the previous epoch
+available on-chain, consumers would need to maintain their own off-chain
+schedule history, which undermines the self-contained nature of this proposal.
+The additional ~344 KB of state is a modest cost for enabling this use case.
 
 ### Single Combined Account with Both Epochs
 
@@ -244,14 +281,17 @@ Storing both epochs in one account would halve the number of accounts but
 roughly double the account size. Separate accounts allow programs to load only
 the epoch they need, reducing per-transaction account data.
 
-### Including Vote Addresses in Identity Table
+### Identity-Only Table (No Vote Addresses)
 
-The Identity Table stores only validator identity pubkeys. An alternative is to
-include vote account addresses alongside each identity, doubling the per-entry
-size to 64 bytes (~128 KB for 2,000 validators). This was not included because
-vote accounts are already queryable on-chain by their address, and programs
-needing the mapping can perform that lookup separately. Community feedback is
-welcome on whether the added utility would justify the size increase.
+An alternative is to store only the 32-byte validator identity in each table
+entry, halving the identity table size (~64 KB vs ~128 KB at current mainnet
+parameters). However, the Solana runtime internally keys leader assignment on
+the combination of identity and vote account. A single identity can operate
+multiple vote accounts, each with its own stake. Without vote addresses in the
+table, it is impossible to determine which vote account was assigned a given
+slot, making per-vote-account skip rate computation infeasible. Since skip rate
+analysis is a primary motivation for including the previous epoch, omitting
+vote addresses would undermine that use case.
 
 ### u32 Indices
 
@@ -264,18 +304,19 @@ current validator count — the space savings are worthwhile.
 
 ### Account Size
 
-Each account is ~280 KB at current mainnet parameters. This is comparable in
+Each account is ~344 KB at current mainnet parameters. This is comparable in
 size to large existing accounts (programs, etc.) and well within the 10 MB
-limit. The combined footprint of ~560 KB for both accounts is modest relative
+limit. The combined footprint of ~1.03 MB for three accounts is modest relative
 to overall validator memory usage.
 
 ### Capitalization Impact
 
 Creating these accounts at feature activation increases total capitalization by
-the rent-exempt minimum for ~560 KB of account data. At current rent parameters
-this is approximately 4 SOL. This is a one-time, small increase that occurs
-at the epoch boundary when the feature activates. No ongoing lamport changes
-occur beyond minor adjustments if account sizes change between epochs.
+the rent-exempt minimum for ~1.03 MB of account data. At current rent
+parameters this is approximately 7 SOL. This is a one-time, small increase
+that occurs at the epoch boundary when the feature activates. No ongoing
+lamport changes occur beyond minor adjustments if account sizes change between
+epochs.
 
 ### Read-Only Guarantees
 
@@ -283,9 +324,9 @@ The accounts are protected by two independent mechanisms:
 
 1. **Program-level:** The owning native program rejects all instructions, so no
    transaction can modify the accounts through program invocation.
-2. **Transaction-level:** The program ID and both PDA addresses are added to the
-   reserved account keys list (gated on the same feature). This prevents any
-   transaction from acquiring a write lock on these accounts, even if a
+2. **Transaction-level:** The program ID and all three PDA addresses are added
+   to the reserved account keys list (gated on the same feature). This prevents
+   any transaction from acquiring a write lock on these accounts, even if a
    malicious program were to claim ownership.
 
 Combined, these provide the same integrity guarantee as sysvar accounts.

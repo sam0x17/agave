@@ -13,6 +13,15 @@ use {
     std::sync::LazyLock,
 };
 
+/// PDA for the previous epoch's leader schedule account.
+pub static PREVIOUS_SCHEDULE_ADDR: LazyLock<Pubkey> = LazyLock::new(|| {
+    let (pubkey, _) = Pubkey::find_program_address(
+        &[b"previous_schedule"],
+        &solana_leader_schedule_program::id(),
+    );
+    pubkey
+});
+
 /// PDA for the current epoch's leader schedule account.
 pub static CURRENT_SCHEDULE_ADDR: LazyLock<Pubkey> = LazyLock::new(|| {
     let (pubkey, _) = Pubkey::find_program_address(
@@ -41,20 +50,20 @@ fn write_schedule_account(bank: &Bank, epoch: Epoch, dest_addr: &Pubkey) {
         .try_into()
         .expect("slots in epoch must fit in usize");
 
-    let slots_per_block = NUM_CONSECUTIVE_LEADER_SLOTS;
+    let slots_per_span = NUM_CONSECUTIVE_LEADER_SLOTS;
 
     // Compute the schedule the same way LeaderScheduleCache does.
     let schedule = solana_leader_schedule::LeaderSchedule::new(
         vote_accounts,
         epoch,
         slots_in_epoch,
-        slots_per_block,
+        slots_per_span,
     );
 
-    // Extract identity pubkeys per slot for serialization.
-    let slot_leaders: Vec<Pubkey> = schedule.get_slot_leaders().iter().map(|sl| sl.id).collect();
+    // Extract SlotLeader pairs (identity + vote address) per slot.
+    let slot_leaders: Vec<_> = schedule.get_slot_leaders().to_vec();
 
-    let data = format::serialize_leader_schedule(&slot_leaders, epoch, slots_per_block.get());
+    let data = format::serialize_leader_schedule(&slot_leaders, epoch, slots_per_span.get());
     let lamports = bank
         .rent_collector()
         .rent
@@ -68,9 +77,9 @@ fn write_schedule_account(bank: &Bank, epoch: Epoch, dest_addr: &Pubkey) {
 
 /// Update the on-chain leader schedule accounts at an epoch boundary.
 ///
-/// Called from `process_new_epoch()`. On the first activation, both accounts
-/// are bootstrapped. On subsequent epoch boundaries, `next` is rotated into
-/// `current` and a new `next` is computed.
+/// Called from `process_new_epoch()`. On the first activation, all three
+/// accounts are bootstrapped. On subsequent epoch boundaries, accounts are
+/// rotated: current -> previous, next -> current, and a new next is computed.
 pub(crate) fn update_on_chain_leader_schedule(bank: &Bank) {
     let current_epoch = bank.epoch();
     let next_epoch = current_epoch + 1;
@@ -80,12 +89,17 @@ pub(crate) fn update_on_chain_leader_schedule(bank: &Bank) {
     if is_bootstrap {
         // First activation: populate current. Only populate next if
         // vote accounts for that epoch are already available.
+        // Previous is left empty (no prior epoch data available).
         write_schedule_account(bank, current_epoch, &CURRENT_SCHEDULE_ADDR);
         if bank.epoch_vote_accounts(next_epoch).is_some() {
             write_schedule_account(bank, next_epoch, &NEXT_SCHEDULE_ADDR);
         }
     } else {
-        // Rotate: copy next -> current (if next exists), then compute new next.
+        // Rotate: current -> previous, next -> current, compute new next.
+        if let Some(current_account) = bank.get_account(&CURRENT_SCHEDULE_ADDR) {
+            bank.store_account_and_update_capitalization(&PREVIOUS_SCHEDULE_ADDR, &current_account);
+        }
+
         if let Some(next_account) = bank.get_account(&NEXT_SCHEDULE_ADDR) {
             bank.store_account_and_update_capitalization(&CURRENT_SCHEDULE_ADDR, &next_account);
         } else {
@@ -108,7 +122,7 @@ mod tests {
             leader_schedule_utils,
         },
         solana_account::ReadableAccount,
-        solana_leader_schedule::on_chain::{deserialize_header, get_leader_at_block},
+        solana_leader_schedule::on_chain::{deserialize_header, get_leader_at_span},
     };
 
     /// Verify the hardcoded PDA addresses in reserved-account-keys match
@@ -122,10 +136,18 @@ mod tests {
         let next_expected = Pubkey::from_str_const("9RXx9Z8EcmAnv3LMHk8GLzM5wsyUT8G4YoVfiqsURGMN");
         assert_eq!(*CURRENT_SCHEDULE_ADDR, current_expected);
         assert_eq!(*NEXT_SCHEDULE_ADDR, next_expected);
+
+        // Just verify previous PDA is derivable (no hardcoded address yet in reserved keys
+        // since it's not populated at bootstrap).
+        let (previous_expected, _) = Pubkey::find_program_address(
+            &[b"previous_schedule"],
+            &solana_leader_schedule_program::id(),
+        );
+        assert_eq!(*PREVIOUS_SCHEDULE_ADDR, previous_expected);
     }
 
     #[test]
-    fn test_bootstrap_creates_both_accounts() {
+    fn test_bootstrap_creates_current_account() {
         let leader_pubkey = solana_pubkey::new_rand();
         let genesis_config = create_genesis_config_with_leader(
             0,
@@ -150,22 +172,25 @@ mod tests {
         let header = deserialize_header(current.data()).unwrap();
         assert_eq!(header.epoch, epoch);
         assert!(header.num_leaders > 0);
-        assert!(header.num_slot_blocks > 0);
+        assert!(header.num_leader_spans > 0);
         assert_eq!(
-            header.slots_per_block,
+            header.slots_per_span,
             NUM_CONSECUTIVE_LEADER_SLOTS.get() as u16
         );
 
         // The sole leader should be leader_pubkey.
-        let leader = get_leader_at_block(current.data(), 0).unwrap();
-        assert_eq!(leader, leader_pubkey);
+        let leader = get_leader_at_span(current.data(), 0).unwrap();
+        assert_eq!(leader.id, leader_pubkey);
+
+        // Previous should not exist after bootstrap.
+        assert!(bank.get_account(&PREVIOUS_SCHEDULE_ADDR).is_none());
 
         // Verify owner is the leader schedule program.
         assert_eq!(*current.owner(), solana_leader_schedule_program::id());
     }
 
     #[test]
-    fn test_rotation_copies_next_to_current() {
+    fn test_rotation_moves_current_to_previous() {
         let leader_pubkey = solana_pubkey::new_rand();
         let genesis_config = create_genesis_config_with_leader(
             0,
@@ -179,10 +204,18 @@ mod tests {
         // Bootstrap.
         update_on_chain_leader_schedule(&bank);
 
+        // Save current's data before rotation.
+        let current_before = bank.get_account(&CURRENT_SCHEDULE_ADDR).unwrap();
+        let current_data_before = current_before.data().to_vec();
+
         // Simulate a subsequent epoch boundary update.
         update_on_chain_leader_schedule(&bank);
 
-        // After rotation, current should still be valid.
+        // After rotation, previous should contain what current had before.
+        let previous = bank.get_account(&PREVIOUS_SCHEDULE_ADDR).unwrap();
+        assert_eq!(previous.data(), &current_data_before);
+
+        // Current should still be valid.
         let current = bank.get_account(&CURRENT_SCHEDULE_ADDR).unwrap();
         assert!(deserialize_header(current.data()).is_some());
     }
@@ -209,14 +242,18 @@ mod tests {
         let current = bank.get_account(&CURRENT_SCHEDULE_ADDR).unwrap();
         let header = deserialize_header(current.data()).unwrap();
 
-        // Verify every slot block matches.
-        for block_idx in 0..header.num_slot_blocks as usize {
-            let slot_idx = block_idx * header.slots_per_block as usize;
-            let on_chain_leader = get_leader_at_block(current.data(), block_idx).unwrap();
-            let canonical_leader = canonical_schedule[slot_idx as u64].id;
+        // Verify every leader span matches.
+        for span_idx in 0..header.num_leader_spans as usize {
+            let slot_idx = span_idx * header.slots_per_span as usize;
+            let on_chain_leader = get_leader_at_span(current.data(), span_idx).unwrap();
+            let canonical_leader = canonical_schedule[slot_idx as u64];
             assert_eq!(
-                on_chain_leader, canonical_leader,
-                "mismatch at block {block_idx} (slot {slot_idx})"
+                on_chain_leader.id, canonical_leader.id,
+                "identity mismatch at span {span_idx} (slot {slot_idx})"
+            );
+            assert_eq!(
+                on_chain_leader.vote_address, canonical_leader.vote_address,
+                "vote address mismatch at span {span_idx} (slot {slot_idx})"
             );
         }
     }
