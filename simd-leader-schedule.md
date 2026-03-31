@@ -64,16 +64,17 @@ Three accounts are maintained: one for the **previous epoch**, one for the
 self-describing binary layout with the identity table (including vote
 addresses) and the schedule index array.
 
-All multi-byte integers are little-endian. The binary layout is **packed** with
-no alignment padding between fields.
+All multi-byte integers are little-endian. Header fields are ordered by
+descending alignment (u32, u32, u64, u16, u16) so the layout is naturally
+aligned with no padding.
 
 ```
 ┌───────────────────────────────────────────────────────┐
-│ Header (18 bytes, packed)                             │
-│   version: u16          — format version (currently 1)│
+│ Header (20 bytes, naturally aligned)                  │
+│   version: u32          — format version (currently 1)│
+│   num_leader_spans: u32 — leader spans in schedule    │
 │   epoch: u64            — epoch this schedule is for  │
 │   num_leaders: u16      — unique entries in table     │
-│   num_leader_spans: u32 — leader spans in schedule    │
 │   slots_per_span: u16   — slots per leader span       │
 ├───────────────────────────────────────────────────────┤
 │ Identity Table (num_leaders × 64 bytes)               │
@@ -88,10 +89,13 @@ no alignment padding between fields.
 ```
 
 The `version` field is the first field in the header, enabling clients to read
-the first two bytes to detect incompatible format changes and fail gracefully
+the first four bytes to detect incompatible format changes and fail gracefully
 rather than silently misparse account data. This proposal defines version 1.
 Future SIMDs that alter the layout (e.g. wider indices, additional fields)
-would increment the version.
+would increment the version. A `u32` is used rather than `u16` because placing
+a 4-byte field first allows the remaining header fields to be naturally aligned
+without padding, and the 2-byte cost is negligible relative to the ~344 KB
+account size.
 
 A **leader span** refers to a group of consecutive slots assigned to a single
 leader. The `slots_per_span` field records how many slots comprise each span
@@ -112,7 +116,7 @@ With mainnet parameters (432,000 slots/epoch, ~2,000 active validators):
 
 | Component | Calculation | Size |
 |-----------|------------|------|
-| Header | fixed | 18 bytes |
+| Header | fixed | 20 bytes |
 | Identity Table | 2,000 × 64 bytes | 128 KB |
 | Schedule | 108,000 × 2 bytes | 216 KB |
 | **Total per account** | | **~344 KB** |

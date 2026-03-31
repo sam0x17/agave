@@ -8,11 +8,11 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────┐
-//! │ Header (18 bytes, packed)                           │
-//! │   version: u16          — format version (1)        │
+//! │ Header (20 bytes, naturally aligned)                │
+//! │   version: u32          — format version (1)        │
+//! │   num_leader_spans: u32                             │
 //! │   epoch: u64                                        │
 //! │   num_leaders: u16                                  │
-//! │   num_leader_spans: u32                             │
 //! │   slots_per_span: u16                               │
 //! ├─────────────────────────────────────────────────────┤
 //! │ Identity Table (num_leaders × 64 bytes)             │
@@ -28,10 +28,10 @@
 use {crate::SlotLeader, solana_clock::Epoch, solana_pubkey::Pubkey, std::collections::HashMap};
 
 /// Current format version.
-pub const VERSION: u16 = 1;
+pub const VERSION: u32 = 1;
 
-/// Size of the fixed header in bytes (packed, no padding).
-pub const HEADER_SIZE: usize = 18;
+/// Size of the fixed header in bytes (naturally aligned, no padding).
+pub const HEADER_SIZE: usize = 20;
 
 /// Size of one identity table entry: (identity Pubkey, vote account Pubkey).
 pub const IDENTITY_ENTRY_SIZE: usize = 64;
@@ -70,12 +70,12 @@ pub fn serialize_leader_schedule(
         HEADER_SIZE + num_leaders * IDENTITY_ENTRY_SIZE + num_leader_spans * SCHEDULE_INDEX_SIZE;
     let mut data = vec![0u8; data_len];
 
-    // Write header (packed, no padding).
-    data[0..2].copy_from_slice(&VERSION.to_le_bytes());
-    data[2..10].copy_from_slice(&epoch.to_le_bytes());
-    data[10..12].copy_from_slice(&(num_leaders as u16).to_le_bytes());
-    data[12..16].copy_from_slice(&(num_leader_spans as u32).to_le_bytes());
-    data[16..18].copy_from_slice(&(slots_per_span as u16).to_le_bytes());
+    // Write header (naturally aligned, no padding).
+    data[0..4].copy_from_slice(&VERSION.to_le_bytes());
+    data[4..8].copy_from_slice(&(num_leader_spans as u32).to_le_bytes());
+    data[8..16].copy_from_slice(&epoch.to_le_bytes());
+    data[16..18].copy_from_slice(&(num_leaders as u16).to_le_bytes());
+    data[18..20].copy_from_slice(&(slots_per_span as u16).to_le_bytes());
 
     // Write identity table: (identity, vote_account) pairs.
     let identities_start = HEADER_SIZE;
@@ -101,10 +101,10 @@ pub fn serialize_leader_schedule(
 /// Deserialized header from an on-chain leader schedule account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaderScheduleHeader {
-    pub version: u16,
+    pub version: u32,
+    pub num_leader_spans: u32,
     pub epoch: Epoch,
     pub num_leaders: u16,
-    pub num_leader_spans: u32,
     pub slots_per_span: u16,
 }
 
@@ -116,14 +116,14 @@ pub fn deserialize_header(data: &[u8]) -> Option<LeaderScheduleHeader> {
     if data.len() < HEADER_SIZE {
         return None;
     }
-    let version = u16::from_le_bytes(data[0..2].try_into().ok()?);
+    let version = u32::from_le_bytes(data[0..4].try_into().ok()?);
     if version != VERSION {
         return None;
     }
-    let epoch = u64::from_le_bytes(data[2..10].try_into().ok()?);
-    let num_leaders = u16::from_le_bytes(data[10..12].try_into().ok()?);
-    let num_leader_spans = u32::from_le_bytes(data[12..16].try_into().ok()?);
-    let slots_per_span = u16::from_le_bytes(data[16..18].try_into().ok()?);
+    let num_leader_spans = u32::from_le_bytes(data[4..8].try_into().ok()?);
+    let epoch = u64::from_le_bytes(data[8..16].try_into().ok()?);
+    let num_leaders = u16::from_le_bytes(data[16..18].try_into().ok()?);
+    let slots_per_span = u16::from_le_bytes(data[18..20].try_into().ok()?);
 
     if slots_per_span == 0 {
         return None;
@@ -138,9 +138,9 @@ pub fn deserialize_header(data: &[u8]) -> Option<LeaderScheduleHeader> {
 
     Some(LeaderScheduleHeader {
         version,
+        num_leader_spans,
         epoch,
         num_leaders,
-        num_leader_spans,
         slots_per_span,
     })
 }
@@ -232,9 +232,9 @@ mod tests {
 
         let header = deserialize_header(&data).unwrap();
         assert_eq!(header.version, VERSION);
+        assert_eq!(header.num_leader_spans, 3);
         assert_eq!(header.epoch, epoch);
         assert_eq!(header.num_leaders, 3);
-        assert_eq!(header.num_leader_spans, 3);
         assert_eq!(header.slots_per_span, 4);
 
         // Verify entries are sorted by identity
@@ -362,7 +362,7 @@ mod tests {
         let mut data = serialize_leader_schedule(&slot_leaders, 0, SLOTS_PER_SPAN);
 
         // Overwrite version to 99
-        data[0..2].copy_from_slice(&99u16.to_le_bytes());
+        data[0..4].copy_from_slice(&99u32.to_le_bytes());
         assert!(deserialize_header(&data).is_none());
     }
 
@@ -375,8 +375,8 @@ mod tests {
         let expected_size =
             HEADER_SIZE + num_validators * IDENTITY_ENTRY_SIZE + num_spans * SCHEDULE_INDEX_SIZE;
 
-        // 18 + 128000 + 216000 = 344018 bytes ≈ 336 KB
-        assert_eq!(expected_size, 344_018);
+        // 20 + 128000 + 216000 = 344020 bytes ≈ 336 KB
+        assert_eq!(expected_size, 344_020);
         assert!(expected_size < 10 * 1024 * 1024); // well under 10MB limit
     }
 
