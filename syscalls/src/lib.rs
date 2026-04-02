@@ -1008,20 +1008,20 @@ declare_builtin_function!(
                     .bls12_381_g1_validate_cost;
                 consume_compute_meter(invoke_context, cost)?;
 
-                let point = translate_type::<agave_bls12_381::PodG1Point>(
+                let point = translate_type::<solana_bls12_381_syscall::PodG1Point>(
                     memory_mapping,
                     point_addr,
                     invoke_context.get_check_aligned(),
                 )?;
 
                 let endianness = if curve_id == BLS12_381_G1_LE {
-                    agave_bls12_381::Endianness::LE
+                    solana_bls12_381_syscall::Endianness::LE
                 } else {
-                    agave_bls12_381::Endianness::BE
+                    solana_bls12_381_syscall::Endianness::BE
                 };
 
-                if agave_bls12_381::bls12_381_g1_point_validation(
-                    agave_bls12_381::Version::V0,
+                if solana_bls12_381_syscall::bls12_381_g1_point_validation(
+                    solana_bls12_381_syscall::Version::V0,
                     point,
                     endianness,
                 ) {
@@ -1036,20 +1036,20 @@ declare_builtin_function!(
                     .bls12_381_g2_validate_cost;
                 consume_compute_meter(invoke_context, cost)?;
 
-                let point = translate_type::<agave_bls12_381::PodG2Point>(
+                let point = translate_type::<solana_bls12_381_syscall::PodG2Point>(
                     memory_mapping,
                     point_addr,
                     invoke_context.get_check_aligned(),
                 )?;
 
                 let endianness = if curve_id == BLS12_381_G2_LE {
-                    agave_bls12_381::Endianness::LE
+                    solana_bls12_381_syscall::Endianness::LE
                 } else {
-                    agave_bls12_381::Endianness::BE
+                    solana_bls12_381_syscall::Endianness::BE
                 };
 
-                if agave_bls12_381::bls12_381_g2_point_validation(
-                    agave_bls12_381::Version::V0,
+                if solana_bls12_381_syscall::bls12_381_g2_point_validation(
+                    solana_bls12_381_syscall::Version::V0,
                     point,
                     endianness,
                 ) {
@@ -1086,7 +1086,7 @@ declare_builtin_function!(
     ) -> Result<u64, Error> {
         use {
             crate::bls12_381_curve_id::*,
-            agave_bls12_381::{
+            solana_bls12_381_syscall::{
                 PodG1Compressed as PodBLSG1Compressed, PodG1Point as PodBLSG1Point,
                 PodG2Compressed as PodBLSG2Compressed, PodG2Point as PodBLSG2Point,
             },
@@ -1106,13 +1106,13 @@ declare_builtin_function!(
                 )?;
 
                 let endianness = if curve_id == BLS12_381_G1_LE {
-                    agave_bls12_381::Endianness::LE
+                    solana_bls12_381_syscall::Endianness::LE
                 } else {
-                    agave_bls12_381::Endianness::BE
+                    solana_bls12_381_syscall::Endianness::BE
                 };
 
-                if let Some(affine_point) = agave_bls12_381::bls12_381_g1_decompress(
-                    agave_bls12_381::Version::V0,
+                if let Some(affine_point) = solana_bls12_381_syscall::bls12_381_g1_decompress(
+                    solana_bls12_381_syscall::Version::V0,
                     compressed_point,
                     endianness,
                 ) {
@@ -1140,13 +1140,13 @@ declare_builtin_function!(
                 )?;
 
                 let endianness = if curve_id == BLS12_381_G2_LE {
-                    agave_bls12_381::Endianness::LE
+                    solana_bls12_381_syscall::Endianness::LE
                 } else {
-                    agave_bls12_381::Endianness::BE
+                    solana_bls12_381_syscall::Endianness::BE
                 };
 
-                if let Some(affine_point) = agave_bls12_381::bls12_381_g2_decompress(
-                    agave_bls12_381::Version::V0,
+                if let Some(affine_point) = solana_bls12_381_syscall::bls12_381_g2_decompress(
+                    solana_bls12_381_syscall::Version::V0,
                     compressed_point,
                     endianness,
                 ) {
@@ -1184,7 +1184,7 @@ declare_builtin_function!(
     ) -> Result<u64, Error> {
         use {
             crate::bls12_381_curve_id::*,
-            agave_bls12_381::{
+            solana_bls12_381_syscall::{
                 PodG1Point as PodBLSG1Point, PodG2Point as PodBLSG2Point, PodScalar as PodBLSScalar,
             },
             solana_curve25519::{
@@ -1403,9 +1403,9 @@ declare_builtin_function!(
 
             BLS12_381_G1_LE | BLS12_381_G1_BE => {
                 let endianness = if curve_id == BLS12_381_G1_LE {
-                    agave_bls12_381::Endianness::LE
+                    solana_bls12_381_syscall::Endianness::LE
                 } else {
-                    agave_bls12_381::Endianness::BE
+                    solana_bls12_381_syscall::Endianness::BE
                 };
 
                 match group_op {
@@ -1424,8 +1424,8 @@ declare_builtin_function!(
                             invoke_context.get_check_aligned(),
                         )?;
 
-                        if let Some(result_point) = agave_bls12_381::bls12_381_g1_addition(
-                            agave_bls12_381::Version::V0,
+                        if let Some(result_point) = solana_bls12_381_syscall::bls12_381_g1_addition(
+                            solana_bls12_381_syscall::Version::V0,
                             left_point,
                             right_point,
                             endianness,
@@ -1458,12 +1458,14 @@ declare_builtin_function!(
                             invoke_context.get_check_aligned(),
                         )?;
 
-                        if let Some(result_point) = agave_bls12_381::bls12_381_g1_subtraction(
-                            agave_bls12_381::Version::V0,
-                            left_point,
-                            right_point,
-                            endianness,
-                        ) {
+                        if let Some(result_point) =
+                            solana_bls12_381_syscall::bls12_381_g1_subtraction(
+                                solana_bls12_381_syscall::Version::V0,
+                                left_point,
+                                right_point,
+                                endianness,
+                            )
+                        {
                             translate_mut!(
                                 memory_mapping,
                                 invoke_context.get_check_aligned(),
@@ -1492,12 +1494,14 @@ declare_builtin_function!(
                             invoke_context.get_check_aligned(),
                         )?;
 
-                        if let Some(result_point) = agave_bls12_381::bls12_381_g1_multiplication(
-                            agave_bls12_381::Version::V0,
-                            point,
-                            scalar,
-                            endianness,
-                        ) {
+                        if let Some(result_point) =
+                            solana_bls12_381_syscall::bls12_381_g1_multiplication(
+                                solana_bls12_381_syscall::Version::V0,
+                                point,
+                                scalar,
+                                endianness,
+                            )
+                        {
                             translate_mut!(
                                 memory_mapping,
                                 invoke_context.get_check_aligned(),
@@ -1516,9 +1520,9 @@ declare_builtin_function!(
             // New BLS12-381 G2 Implementation
             BLS12_381_G2_LE | BLS12_381_G2_BE => {
                 let endianness = if curve_id == BLS12_381_G2_LE {
-                    agave_bls12_381::Endianness::LE
+                    solana_bls12_381_syscall::Endianness::LE
                 } else {
-                    agave_bls12_381::Endianness::BE
+                    solana_bls12_381_syscall::Endianness::BE
                 };
 
                 match group_op {
@@ -1537,8 +1541,8 @@ declare_builtin_function!(
                             invoke_context.get_check_aligned(),
                         )?;
 
-                        if let Some(result_point) = agave_bls12_381::bls12_381_g2_addition(
-                            agave_bls12_381::Version::V0,
+                        if let Some(result_point) = solana_bls12_381_syscall::bls12_381_g2_addition(
+                            solana_bls12_381_syscall::Version::V0,
                             left_point,
                             right_point,
                             endianness,
@@ -1571,12 +1575,14 @@ declare_builtin_function!(
                             invoke_context.get_check_aligned(),
                         )?;
 
-                        if let Some(result_point) = agave_bls12_381::bls12_381_g2_subtraction(
-                            agave_bls12_381::Version::V0,
-                            left_point,
-                            right_point,
-                            endianness,
-                        ) {
+                        if let Some(result_point) =
+                            solana_bls12_381_syscall::bls12_381_g2_subtraction(
+                                solana_bls12_381_syscall::Version::V0,
+                                left_point,
+                                right_point,
+                                endianness,
+                            )
+                        {
                             translate_mut!(
                                 memory_mapping,
                                 invoke_context.get_check_aligned(),
@@ -1605,12 +1611,14 @@ declare_builtin_function!(
                             invoke_context.get_check_aligned(),
                         )?;
 
-                        if let Some(result_point) = agave_bls12_381::bls12_381_g2_multiplication(
-                            agave_bls12_381::Version::V0,
-                            point,
-                            scalar,
-                            endianness,
-                        ) {
+                        if let Some(result_point) =
+                            solana_bls12_381_syscall::bls12_381_g2_multiplication(
+                                solana_bls12_381_syscall::Version::V0,
+                                point,
+                                scalar,
+                                endianness,
+                            )
+                        {
                             translate_mut!(
                                 memory_mapping,
                                 invoke_context.get_check_aligned(),
@@ -1772,7 +1780,7 @@ declare_builtin_function!(
     ) -> Result<u64, Error> {
         use {
             crate::bls12_381_curve_id::*,
-            agave_bls12_381::{
+            solana_bls12_381_syscall::{
                 PodG1Point as PodBLSG1Point, PodG2Point as PodBLSG2Point,
                 PodGtElement as PodBLSGtElement,
             },
@@ -1805,13 +1813,13 @@ declare_builtin_function!(
                 )?;
 
                 let endianness = if curve_id == BLS12_381_LE {
-                    agave_bls12_381::Endianness::LE
+                    solana_bls12_381_syscall::Endianness::LE
                 } else {
-                    agave_bls12_381::Endianness::BE
+                    solana_bls12_381_syscall::Endianness::BE
                 };
 
-                if let Some(gt_element) = agave_bls12_381::bls12_381_pairing_map(
-                    agave_bls12_381::Version::V0,
+                if let Some(gt_element) = solana_bls12_381_syscall::bls12_381_pairing_map(
+                    solana_bls12_381_syscall::Version::V0,
                     g1_points,
                     g2_points,
                     endianness,

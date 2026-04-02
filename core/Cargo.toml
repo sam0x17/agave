@@ -64,9 +64,9 @@ dashmap = { workspace = true, features = ["rayon", "raw-api"] }
 futures = { workspace = true }
 histogram = { workspace = true }
 itertools = { workspace = true }
+lazy-lru = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
-lru = { workspace = true }
 min-max-heap = { workspace = true }
 num_cpus = { workspace = true }
 num_enum = { workspace = true }
@@ -77,9 +77,11 @@ rand = { workspace = true }
 rand_chacha = { workspace = true }
 rayon = { workspace = true }
 rolling-file = { workspace = true }
+rts-alloc = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
+shaq = { workspace = true }
 signal-hook = { workspace = true }
 slab = { workspace = true }
 solana-account = { workspace = true }
@@ -171,8 +173,6 @@ trees = { workspace = true }
 wincode = { workspace = true }
 
 [target."cfg(unix)".dependencies]
-rts-alloc = { workspace = true }
-shaq = { workspace = true }
 sysctl = { workspace = true }
 
 [dev-dependencies]

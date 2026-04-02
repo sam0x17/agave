@@ -1,7 +1,6 @@
 use {
     super::latest_validator_vote_packet::{LatestValidatorVote, VoteSource},
     crate::banking_stage::transaction_scheduler::transaction_state_container::SharedBytes,
-    agave_feature_set as feature_set,
     agave_transaction_view::transaction_view::SanitizedTransactionView,
     ahash::HashMap,
     itertools::Itertools,
@@ -68,9 +67,7 @@ impl VoteStorage {
             cached_epoch_stakes,
             cached_epoch_authorized_voters,
             current_epoch: bank.epoch(),
-            deprecate_legacy_vote_ixs: bank
-                .feature_set
-                .is_active(&feature_set::deprecate_legacy_vote_ixs::id()),
+            deprecate_legacy_vote_ixs: bank.feature_set.snapshot().deprecate_legacy_vote_ixs,
         }
     }
 
@@ -198,9 +195,7 @@ impl VoteStorage {
                 .expect("Epoch stakes for the current bank must be available");
             self.cached_epoch_stakes = current_epoch_stakes;
             self.current_epoch = bank.epoch();
-            self.deprecate_legacy_vote_ixs = bank
-                .feature_set
-                .is_active(&feature_set::deprecate_legacy_vote_ixs::id());
+            self.deprecate_legacy_vote_ixs = bank.feature_set.snapshot().deprecate_legacy_vote_ixs;
         }
 
         // Evict any now unstaked pubkeys
@@ -855,9 +850,10 @@ pub(crate) mod tests {
         let genesis_config =
             genesis_utils::create_genesis_config_with_vote_accounts(100, &[&keypair], vec![200])
                 .genesis_config;
-        let bank_0 = Bank::new_for_tests(&genesis_config);
+        let (bank_0, _bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
         let mut bank = Bank::new_from_parent(
-            Arc::new(bank_0),
+            bank_0,
             SlotLeader::new_unique(),
             MINIMUM_SLOTS_PER_EPOCH, // This puts us in epoch 1
         );
@@ -939,9 +935,9 @@ pub(crate) mod tests {
         let config =
             genesis_utils::create_genesis_config_with_vote_accounts(100, &[&keypair_a], vec![200])
                 .genesis_config;
-        let bank_0 = Bank::new_for_tests(&config);
+        let (bank_0, _bank_forks) = Bank::new_for_tests(&config).wrap_with_bank_forks_for_tests();
         let bank = Bank::new_from_parent(
-            Arc::new(bank_0),
+            bank_0,
             SlotLeader::new_unique(),
             MINIMUM_SLOTS_PER_EPOCH - 1,
         );
@@ -954,12 +950,8 @@ pub(crate) mod tests {
         let config =
             genesis_utils::create_genesis_config_with_vote_accounts(100, &[&keypair_b], vec![200])
                 .genesis_config;
-        let bank_0 = Bank::new_for_tests(&config);
-        let bank = Bank::new_from_parent(
-            Arc::new(bank_0),
-            SlotLeader::new_unique(),
-            MINIMUM_SLOTS_PER_EPOCH,
-        );
+        let (bank_0, _bank_forks) = Bank::new_for_tests(&config).wrap_with_bank_forks_for_tests();
+        let bank = Bank::new_from_parent(bank_0, SlotLeader::new_unique(), MINIMUM_SLOTS_PER_EPOCH);
         assert_eq!(bank.epoch(), 1);
         vote_storage.cache_epoch_boundary_info(&bank);
         vote_storage.insert_batch(VoteSource::Gossip, votes().into_iter());
@@ -970,12 +962,15 @@ pub(crate) mod tests {
         );
 
         // Previously unstaked votes are removed
+        // Use warp_from_parent: it explicitly calls update_epoch_stakes(get_epoch(slot)),
+        // which populates epoch_stakes with the key cache_epoch_boundary_info expects
+        // (bank.epoch()). new_from_parent uses get_leader_schedule_epoch which can differ.
         let config =
             genesis_utils::create_genesis_config_with_vote_accounts(100, &[&keypair_c], vec![200])
                 .genesis_config;
-        let bank_0 = Bank::new_for_tests(&config);
+        let (bank_0, _bank_forks) = Bank::new_for_tests(&config).wrap_with_bank_forks_for_tests();
         let bank = Bank::warp_from_parent(
-            Arc::new(bank_0),
+            bank_0,
             SlotLeader::new_unique(),
             3 * MINIMUM_SLOTS_PER_EPOCH,
         );

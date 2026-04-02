@@ -1,7 +1,7 @@
 //! Program deployment functionality.
 
 #[cfg(feature = "metrics")]
-use {crate::loaded_programs::LoadProgramMetrics, solana_svm_measure::measure::Measure};
+use {crate::program_metrics::LoadProgramMetrics, solana_svm_measure::measure::Measure};
 use {
     crate::{
         invoke_context::InvokeContext,
@@ -19,7 +19,7 @@ use {
         verifier::RequisiteVerifier,
     },
     solana_svm_log_collector::{LogCollector, ic_logger_msg},
-    solana_svm_type_overrides::sync::{Arc, atomic::Ordering},
+    solana_svm_type_overrides::sync::Arc,
     std::{cell::RefCell, rc::Rc},
 };
 
@@ -119,10 +119,7 @@ pub fn deploy_program(
         InstructionError::InvalidAccountData
     })?;
     if let Some(old_entry) = program_cache_for_tx_batch.find(program_id) {
-        executor.tx_usage_counter.store(
-            old_entry.tx_usage_counter.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
+        executor.stats.merge_from(&old_entry.stats);
     }
     #[cfg(feature = "metrics")]
     {
@@ -140,7 +137,7 @@ macro_rules! deploy_program {
             $invoke_context.program_cache_for_tx_batch.slot()
         );
         #[cfg(feature = "metrics")]
-        let mut load_program_metrics = $crate::loaded_programs::LoadProgramMetrics::default();
+        let mut load_program_metrics = $crate::program_metrics::LoadProgramMetrics::default();
         $crate::deploy::deploy_program(
             $invoke_context.get_log_collector(),
             #[cfg(feature = "metrics")]

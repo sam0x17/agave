@@ -26,7 +26,6 @@ use {
     log::*,
     serde::Serialize,
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount, state_traits::StateMut},
-    solana_accounts_db::accounts_index::{ScanConfig, ScanOrder},
     solana_clap_utils::{
         input_parsers::{cluster_type_of, pubkey_of, pubkeys_of},
         input_validators::{
@@ -467,7 +466,7 @@ fn compute_slot_cost(
                     None,
                     SimpleAddressLoader::Disabled,
                     &reserved_account_keys.active,
-                    feature_set.is_active(&agave_feature_set::limit_instruction_accounts::id()),
+                    feature_set.snapshot().limit_instruction_accounts,
                 )
                 .map_err(|err| {
                     warn!("Failed to compute cost of transaction: {err:?}");
@@ -2258,10 +2257,7 @@ fn main() {
 
                     if remove_stake_accounts {
                         for (address, mut account) in bank
-                            .get_program_accounts(
-                                &stake::program::id(),
-                                &ScanConfig::new(ScanOrder::Sorted),
-                            )
+                            .get_program_accounts(&stake::program::id())
                             .unwrap()
                             .into_iter()
                         {
@@ -2285,10 +2281,7 @@ fn main() {
 
                     if !vote_accounts_to_destake.is_empty() {
                         for (address, mut account) in bank
-                            .get_program_accounts(
-                                &stake::program::id(),
-                                &ScanConfig::new(ScanOrder::Sorted),
-                            )
+                            .get_program_accounts(&stake::program::id())
                             .unwrap()
                             .into_iter()
                         {
@@ -2368,10 +2361,7 @@ fn main() {
 
                         // Delete existing vote accounts
                         for (address, mut account) in bank
-                            .get_program_accounts(
-                                &solana_vote_program::id(),
-                                &ScanConfig::new(ScanOrder::Sorted),
-                            )
+                            .get_program_accounts(&solana_vote_program::id())
                             .unwrap()
                             .into_iter()
                         {
@@ -2396,10 +2386,7 @@ fn main() {
                                 ),
                             );
 
-                            let vote_account = if bank
-                                .feature_set
-                                .is_active(&feature_set::vote_state_v4::id())
-                            {
+                            let vote_account = if bank.feature_set.snapshot().vote_state_v4 {
                                 vote_state::create_v4_account_with_authorized(
                                     identity_pubkey,
                                     identity_pubkey,

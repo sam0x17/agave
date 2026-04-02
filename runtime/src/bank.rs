@@ -43,7 +43,10 @@ use {
             },
         },
         bank_forks::BankForks,
-        block_component_processor::{BlockComponentProcessor, vote_reward::VoteRewardAccountState},
+        block_component_processor::{
+            BlockComponentProcessor,
+            vote_reward::epoch_inflation_account_state::EpochInflationAccountState,
+        },
         epoch_stakes::{
             BLSPubkeyToRankMap, DeserializableVersionedEpochStakes, NodeVoteAccounts,
             VersionedEpochStakes,
@@ -66,14 +69,10 @@ use {
     },
     accounts_lt_hash::{CacheValue as AccountsLtHashCacheValue, Stats as AccountsLtHashStats},
     agave_bls_cert_verify::cert_verify::{self, Error as CertVerifyError},
-    agave_feature_set::{
-        self as feature_set, FeatureSet, raise_cpi_nesting_limit_to_8,
-        relax_programdata_account_check_migration,
-    },
+    agave_feature_set::{self as feature_set, FeatureSet},
     agave_precompiles::{get_precompile, get_precompiles, is_precompile},
     agave_reserved_account_keys::ReservedAccountKeys,
     agave_snapshots::snapshot_hash::SnapshotHash,
-    agave_syscalls::create_program_runtime_environment,
     agave_votor_messages::{
         consensus_message::Certificate, migration::GENESIS_CERTIFICATE_ACCOUNT,
     },
@@ -93,7 +92,7 @@ use {
         accounts::{AccountAddressFilter, Accounts, PubkeyAccountSlot},
         accounts_db::{AccountsDb, AccountsDbConfig},
         accounts_hash::AccountsLtHash,
-        accounts_index::{IndexKey, ScanConfig, ScanResult},
+        accounts_index::{IndexKey, ScanResult},
         accounts_update_notifier_interface::AccountsUpdateNotifier,
         ancestors::Ancestors,
         blockhash_queue::BlockhashQueue,
@@ -108,7 +107,7 @@ use {
     solana_cluster_type::ClusterType,
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions,
-    solana_cost_model::{block_cost_limits::simd_0286_block_limits, cost_tracker::CostTracker},
+    solana_cost_model::{block_cost_limits::simd_0286_block_limit, cost_tracker::CostTracker},
     solana_epoch_info::EpochInfo,
     solana_epoch_schedule::EpochSchedule,
     solana_feature_gate_interface as feature,
@@ -168,6 +167,7 @@ use {
     solana_svm_callback::{AccountState, InvokeContextCallback, TransactionProcessingCallback},
     solana_svm_timings::{ExecuteTimingType, ExecuteTimings},
     solana_svm_transaction::svm_message::SVMMessage,
+    solana_syscalls::create_program_runtime_environment,
     solana_system_transaction as system_transaction,
     solana_sysvar::{self as sysvar, SysvarSerialize, last_restart_slot::LastRestartSlot},
     solana_sysvar_id::SysvarId,
@@ -196,7 +196,7 @@ use {
             Arc, LazyLock, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
             atomic::{
                 AtomicBool, AtomicI64, AtomicU64,
-                Ordering::{self, AcqRel, Acquire, Relaxed},
+                Ordering::{AcqRel, Acquire, Relaxed},
             },
         },
         time::{Duration, Instant},
@@ -992,18 +992,6 @@ impl Default for BankTestConfig {
     }
 }
 
-/// Data returned from [`Bank::calculate_epoch_inflation_rewards()`].
-pub(crate) struct EpochInflationRewards {
-    /// Amount of rewards a validator should get if it voted in every slot in
-    /// the epoch and its stake is equal to the network capitalization i.e.
-    /// the total supply.
-    pub(crate) validator_rewards_lamports: u64,
-    /// The current inflation rate for the validators.
-    pub(crate) validator_rate: f64,
-    /// The current inflation rate for the foundation.
-    pub(crate) foundation_rate: f64,
-}
-
 #[derive(Debug, Default, PartialEq)]
 pub struct ProcessedTransactionCounts {
     pub processed_transactions_count: u64,
@@ -1522,8 +1510,7 @@ impl Bank {
                 .transaction_processor
                 .global_program_cache
                 .read()
-                .unwrap()
-                .stats,
+                .unwrap(),
             parent.slot(),
         );
 
@@ -1583,12 +1570,7 @@ impl Bank {
                     self.slot,
                     &mut ExecuteTimings::default(),
                 ) {
-                    recompiled.tx_usage_counter.fetch_add(
-                        program_to_recompile
-                            .tx_usage_counter
-                            .load(Ordering::Relaxed),
-                        Ordering::Relaxed,
-                    );
+                    recompiled.stats.merge_from(&program_to_recompile.stats);
                     let mut program_cache = self
                         .transaction_processor
                         .global_program_cache
@@ -1621,7 +1603,7 @@ impl Bank {
                     .collect();
                 epoch_boundary_preparation
                     .programs_to_recompile
-                    .sort_by_cached_key(|(_id, program)| program.decayed_usage_counter(self.slot));
+                    .sort_by_cached_key(|(_id, program)| program.retention_score());
             } else {
                 epoch_boundary_preparation.programs_to_recompile.clear();
             }
@@ -1784,11 +1766,8 @@ impl Bank {
 
         // the vote reward account state should be created at the epoch boundary in which we
         // activate alpenglow as it will need info from the previous epoch.
-        if self
-            .feature_set
-            .is_active(&agave_feature_set::alpenglow::id())
-        {
-            VoteRewardAccountState::new_epoch_update_account(
+        if self.feature_set.snapshot().alpenglow {
+            EpochInflationAccountState::new_epoch_update_account(
                 self,
                 parent_epoch,
                 parent_capitalization,
@@ -1822,14 +1801,6 @@ impl Bank {
             self.create_program_runtime_environment(&self.feature_set);
         self.transaction_processor
             .set_program_runtime_environment(program_runtime_environment);
-    }
-
-    pub fn byte_limit_for_scans(&self) -> Option<usize> {
-        self.rc
-            .accounts
-            .accounts_db
-            .accounts_index
-            .scan_results_limit_bytes
     }
 
     pub fn proper_ancestors_set(&self) -> HashSet<Slot> {
@@ -1926,27 +1897,29 @@ impl Bank {
             "should be populated (from fields.versioned_epoch_stakes)"
         );
 
-        // Compute and validate the slot leader from epoch stakes
-        let leader: SlotLeader;
-        #[cfg(not(feature = "dev-context-only-utils"))]
-        {
-            _ = leader_for_tests;
-            leader = Self::slot_leader_from_epoch_stakes(
-                fields.slot,
-                &fields.epoch_schedule,
-                &epoch_stakes,
-            );
-        }
-        #[cfg(feature = "dev-context-only-utils")]
-        {
-            leader = leader_for_tests.unwrap_or_else(|| {
+        // Compute and validate the slot leader from epoch stakes.
+        let compute_leader = || {
+            if slot == 0 {
+                // Genesis snapshot has no leader for the genesis block.
+                // Instead the leader is set to the maximum delegated vote account.
+                stakes
+                    .highest_staked_node()
+                    .expect("genesis snapshot should contain at least one staked vote account")
+            } else {
                 Self::slot_leader_from_epoch_stakes(
                     fields.slot,
                     &fields.epoch_schedule,
                     &epoch_stakes,
                 )
-            });
-        }
+            }
+        };
+        #[cfg(not(feature = "dev-context-only-utils"))]
+        let leader = {
+            _ = leader_for_tests;
+            compute_leader()
+        };
+        #[cfg(feature = "dev-context-only-utils")]
+        let leader = leader_for_tests.unwrap_or_else(compute_leader);
         assert_eq!(
             fields.leader_id, leader.id,
             "snapshot leader_id does not match computed slot leader"
@@ -2452,13 +2425,8 @@ impl Bank {
     /// to the top `MAX_ALPENGLOW_VOTE_ACCOUNTS` that contain enough balance for admission.
     fn maybe_burn_vat_from_staked_accounts(&mut self, epoch_stakes: &VersionedEpochStakes) {
         // Only deduct and burn the VAT if both the VAT and alpenglow features are active.
-        if !self
-            .feature_set
-            .is_active(&agave_feature_set::alpenglow::id())
-            || !self
-                .feature_set
-                .is_active(&agave_feature_set::validator_admission_ticket::id())
-        {
+        let feature_snapshot = self.feature_set.snapshot();
+        if !feature_snapshot.alpenglow || !feature_snapshot.validator_admission_ticket {
             return;
         }
 
@@ -2588,30 +2556,17 @@ impl Bank {
         num_slots as f64 / self.slots_per_year
     }
 
-    /// For a given [`capitalization`] (total_supply in lamports) and [`epoch`], calculates various inflation related info.
+    /// For a given `capitalization` (total_supply in lamports) and `epoch`, returns the
+    /// `epoch inflation rewards` in lamports.
     pub(crate) fn calculate_epoch_inflation_rewards(
         &self,
         capitalization: u64,
         epoch: Epoch,
-    ) -> EpochInflationRewards {
+    ) -> u64 {
         let slot_in_year = self.slot_in_year_for_inflation();
-        let (validator_rate, foundation_rate) = {
-            let inflation = self.inflation.read().unwrap();
-            (
-                (*inflation).validator(slot_in_year),
-                (*inflation).foundation(slot_in_year),
-            )
-        };
-
+        let validator_rate = self.inflation.read().unwrap().validator(slot_in_year);
         let epoch_duration_in_years = self.epoch_duration_in_years(epoch);
-        let validator_rewards_lamports =
-            (validator_rate * capitalization as f64 * epoch_duration_in_years) as u64;
-
-        EpochInflationRewards {
-            validator_rewards_lamports,
-            validator_rate,
-            foundation_rate,
-        }
+        (validator_rate * capitalization as f64 * epoch_duration_in_years) as u64
     }
 
     /// Convert computed RewardCommissions to RewardCommissionAccounts for storing.
@@ -2995,7 +2950,7 @@ impl Bank {
 
     pub fn is_blockhash_valid(&self, hash: &Hash) -> bool {
         let blockhash_queue = self.blockhash_queue.read().unwrap();
-        blockhash_queue.is_hash_valid_for_age(hash, self.max_processing_age)
+        blockhash_queue.is_hash_valid_for_age(hash, self.max_processing_age())
     }
 
     pub fn get_minimum_balance_for_rent_exemption(&self, data_len: usize) -> u64 {
@@ -3050,7 +3005,7 @@ impl Bank {
         // length is made variable by epoch
         blockhash_queue
             .get_hash_age(blockhash)
-            .map(|age| self.block_height + self.max_processing_age as u64 - age)
+            .map(|age| self.block_height + self.max_processing_age() as u64 - age)
     }
 
     /// Query the alpenglow genesis certificate account.
@@ -3085,7 +3040,7 @@ impl Bank {
     /// Update the clock sysvar from a block footer's nanosecond timestamp.
     /// Also stores the nanosecond value for later retrieval via `get_nanosecond_clock`.
     pub fn update_clock_from_footer(&self, unix_timestamp_nanos: i64) {
-        if !self.feature_set.is_active(&feature_set::alpenglow::id()) {
+        if !self.feature_set.snapshot().alpenglow {
             return;
         }
 
@@ -3302,10 +3257,7 @@ impl Bank {
     pub fn get_transaction_account_lock_limit(&self) -> usize {
         if let Some(transaction_account_lock_limit) = self.transaction_account_lock_limit {
             transaction_account_lock_limit
-        } else if self
-            .feature_set
-            .is_active(&feature_set::increase_tx_account_lock_limit::id())
-        {
+        } else if self.feature_set.snapshot().increase_tx_account_lock_limit {
             MAX_TX_ACCOUNT_LOCKS
         } else {
             64
@@ -3318,9 +3270,8 @@ impl Bank {
         &self,
         txs: Vec<VersionedTransaction>,
     ) -> Result<TransactionBatch<'_, '_, RuntimeTransaction<SanitizedTransaction>>> {
-        let enable_instruction_account_limit = self
-            .feature_set
-            .is_active(&agave_feature_set::limit_instruction_accounts::id());
+        let enable_instruction_account_limit =
+            self.feature_set.snapshot().limit_instruction_accounts;
         let sanitized_txs = txs
             .into_iter()
             .map(|tx| {
@@ -3354,9 +3305,8 @@ impl Bank {
         tx_results: impl Iterator<Item = Result<()>>,
     ) -> Vec<Result<()>> {
         let tx_account_lock_limit = self.get_transaction_account_lock_limit();
-        let relax_intrabatch_account_locks = self
-            .feature_set
-            .is_active(&feature_set::relax_intrabatch_account_locks::id());
+        let relax_intrabatch_account_locks =
+            self.feature_set.snapshot().relax_intrabatch_account_locks;
 
         // with simd83 enabled, we must fail transactions that duplicate a prior message hash
         // previously, conflicting account locks would fail such transactions as a side effect
@@ -3497,7 +3447,7 @@ impl Bank {
             // After simulation, transactions will need to be forwarded to the leader
             // for processing. During forwarding, the transaction could expire if the
             // delay is not accounted for.
-            self.max_processing_age
+            self.max_processing_age()
                 .saturating_sub(MAX_TRANSACTION_FORWARDING_DELAY),
             &mut timings,
             &mut TransactionErrorMetrics::default(),
@@ -4238,7 +4188,7 @@ impl Bank {
             balance_collector,
         } = self.load_and_execute_transactions(
             batch,
-            self.max_processing_age,
+            self.max_processing_age(),
             timings,
             &mut TransactionErrorMetrics::default(),
             TransactionProcessingConfig {
@@ -4470,10 +4420,26 @@ impl Bank {
         self.rc.accounts.clone()
     }
 
+    fn apply_cost_tracker_limits_for_active_features(&mut self) {
+        let mut cost_tracker = self.write_cost_tracker().unwrap();
+        let block_cost_limit = if self.feature_set.snapshot().raise_block_limits_to_100m {
+            simd_0286_block_limit()
+        } else {
+            cost_tracker.get_block_limit()
+        };
+        let account_cost_limit = block_cost_limit.saturating_mul(40).saturating_div(100);
+        let vote_cost_limit = cost_tracker.get_vote_limit();
+        let allocated_data_size_limit = cost_tracker.get_allocated_data_size_limit();
+        cost_tracker.set_limits(
+            account_cost_limit,
+            block_cost_limit,
+            vote_cost_limit,
+            allocated_data_size_limit,
+        );
+    }
+
     fn apply_simd_0339_invoke_cost_changes(&mut self) {
-        let simd_0268_active = self
-            .feature_set
-            .is_active(&raise_cpi_nesting_limit_to_8::id());
+        let simd_0268_active = self.feature_set.snapshot().raise_cpi_nesting_limit_to_8;
         let compute_budget = self
             .compute_budget()
             .as_ref()
@@ -4500,23 +4466,7 @@ impl Bank {
         // We must apply previously activated features related to limits here
         // so that the initial bank state is consistent with the feature set.
         // Cost-tracker limits are propagated through children banks.
-        if self
-            .feature_set
-            .is_active(&feature_set::raise_block_limits_to_100m::id())
-        {
-            let block_cost_limit = simd_0286_block_limits();
-            let mut cost_tracker = self.write_cost_tracker().unwrap();
-            let account_cost_limit = block_cost_limit.saturating_mul(40).saturating_div(100);
-            let vote_cost_limit = cost_tracker.get_vote_limit();
-            let allocated_data_size_limit = cost_tracker.get_allocated_data_size_limit();
-            cost_tracker.set_limits(
-                account_cost_limit,
-                block_cost_limit,
-                vote_cost_limit,
-                allocated_data_size_limit,
-            );
-        }
-
+        self.apply_cost_tracker_limits_for_active_features();
         self.apply_simd_0339_invoke_cost_changes();
 
         let program_runtime_environment =
@@ -4538,7 +4488,7 @@ impl Bank {
         &self,
         feature_set: &FeatureSet,
     ) -> ProgramRuntimeEnvironment {
-        let simd_0268_active = feature_set.is_active(&raise_cpi_nesting_limit_to_8::id());
+        let simd_0268_active = feature_set.snapshot().raise_cpi_nesting_limit_to_8;
         let compute_budget = self
             .compute_budget()
             .as_ref()
@@ -4661,25 +4611,22 @@ impl Bank {
     pub fn get_program_accounts(
         &self,
         program_id: &Pubkey,
-        config: &ScanConfig,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         self.rc
             .accounts
-            .load_by_program(&self.ancestors, self.bank_id, program_id, config)
+            .load_by_program(&self.ancestors, self.bank_id, program_id)
     }
 
     pub fn get_filtered_program_accounts<F: Fn(&AccountSharedData) -> bool>(
         &self,
         program_id: &Pubkey,
         filter: F,
-        config: &ScanConfig,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         self.rc.accounts.load_by_program_with_filter(
             &self.ancestors,
             self.bank_id,
             program_id,
             filter,
-            config,
         )
     }
 
@@ -4687,7 +4634,6 @@ impl Bank {
         &self,
         index_key: &IndexKey,
         filter: F,
-        config: &ScanConfig,
         byte_limit_for_scan: Option<usize>,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         self.rc.accounts.load_by_index_key_with_filter(
@@ -4695,7 +4641,6 @@ impl Bank {
             self.bank_id,
             index_key,
             filter,
-            config,
             byte_limit_for_scan,
         )
     }
@@ -4712,13 +4657,13 @@ impl Bank {
     }
 
     // Scans all the accounts this bank can load, applying `scan_func`
-    pub fn scan_all_accounts<F>(&self, scan_func: F, sort_results: bool) -> ScanResult<()>
+    pub fn scan_all_accounts<F>(&self, scan_func: F) -> ScanResult<()>
     where
         F: FnMut(Option<(&Pubkey, AccountSharedData, Slot)>),
     {
         self.rc
             .accounts
-            .scan_all(&self.ancestors, self.bank_id, scan_func, sort_results)
+            .scan_all(&self.ancestors, self.bank_id, scan_func)
     }
 
     pub fn get_program_accounts_modified_since_parent(
@@ -4764,7 +4709,6 @@ impl Bank {
         num: usize,
         filter_by_address: &HashSet<Pubkey>,
         filter: AccountAddressFilter,
-        sort_results: bool,
     ) -> ScanResult<Vec<(Pubkey, u64)>> {
         self.rc.accounts.load_largest_accounts(
             &self.ancestors,
@@ -4772,7 +4716,6 @@ impl Bank {
             num,
             filter_by_address,
             filter,
-            sort_results,
         )
     }
 
@@ -5088,9 +5031,8 @@ impl Bank {
             return Err(TransactionError::UnsupportedVersion);
         }
 
-        let enable_instruction_account_limit = self
-            .feature_set
-            .is_active(&agave_feature_set::limit_instruction_accounts::id());
+        let enable_instruction_account_limit =
+            self.feature_set.snapshot().limit_instruction_accounts;
 
         let sanitized_tx = {
             let size =
@@ -5641,7 +5583,8 @@ impl Bank {
         // After feature cleanup, assert that rent exemption threshold is 1.0
         if self
             .feature_set
-            .is_active(&feature_set::deprecate_rent_exemption_threshold::id())
+            .snapshot()
+            .deprecate_rent_exemption_threshold
         {
             self.rent_collector.deprecate_rent_exemption_threshold();
         }
@@ -5741,19 +5684,8 @@ impl Bank {
         }
 
         self.apply_new_builtin_program_feature_transitions(&new_feature_activations);
-
         if new_feature_activations.contains(&feature_set::raise_block_limits_to_100m::id()) {
-            let block_cost_limit = simd_0286_block_limits();
-            let mut cost_tracker = self.write_cost_tracker().unwrap();
-            let account_cost_limit = block_cost_limit.saturating_mul(40).saturating_div(100);
-            let vote_cost_limit = cost_tracker.get_vote_limit();
-            let allocated_data_size_limit = cost_tracker.get_allocated_data_size_limit();
-            cost_tracker.set_limits(
-                account_cost_limit,
-                block_cost_limit,
-                vote_cost_limit,
-                allocated_data_size_limit,
-            );
+            self.apply_cost_tracker_limits_for_active_features();
         }
 
         if new_feature_activations.contains(&feature_set::vote_state_v4::id()) {
@@ -5771,7 +5703,8 @@ impl Bank {
                 &feature_set::replace_spl_token_with_p_token::SPL_TOKEN_PROGRAM_ID,
                 &feature_set::replace_spl_token_with_p_token::PTOKEN_PROGRAM_BUFFER,
                 self.feature_set
-                    .is_active(&relax_programdata_account_check_migration::id()),
+                    .snapshot()
+                    .relax_programdata_account_check_migration,
                 "replace_spl_token_with_p_token",
             ) {
                 warn!(
@@ -5820,7 +5753,8 @@ impl Bank {
                         &builtin.program_id,
                         core_bpf_migration_config,
                         self.feature_set
-                            .is_active(&relax_programdata_account_check_migration::id()),
+                            .snapshot()
+                            .relax_programdata_account_check_migration,
                     ) {
                         warn!(
                             "Failed to migrate builtin {} to Core BPF: {}",
@@ -5841,7 +5775,8 @@ impl Bank {
                         &stateless_builtin.program_id,
                         core_bpf_migration_config,
                         self.feature_set
-                            .is_active(&relax_programdata_account_check_migration::id()),
+                            .snapshot()
+                            .relax_programdata_account_check_migration,
                     ) {
                         warn!(
                             "Failed to migrate stateless builtin {} to Core BPF: {}",
@@ -6156,20 +6091,17 @@ impl Bank {
             .rent_collector
             .rent
             .minimum_balance(VoteStateV4::size_of());
-        let minimum_vote_account_balance =
-            if self.feature_set.is_active(&feature_set::alpenglow::id()) {
-                // When alpenglow is active the minimum required balance is
-                // VAT + rent-exempt minimum for vote account.
-                vote_account_rent_exempt_minimum + VAT_TO_BURN_PER_EPOCH
-            } else {
-                // If alpenglow is not active, the minimum required balance is rent-exempt-minimum
-                vote_account_rent_exempt_minimum
-            };
+        let feature_snapshot = self.feature_set.snapshot();
+        let minimum_vote_account_balance = if feature_snapshot.alpenglow {
+            // When alpenglow is active the minimum required balance is
+            // VAT + rent-exempt minimum for vote account.
+            vote_account_rent_exempt_minimum + VAT_TO_BURN_PER_EPOCH
+        } else {
+            // If alpenglow is not active, the minimum required balance is rent-exempt-minimum
+            vote_account_rent_exempt_minimum
+        };
 
-        if self
-            .feature_set
-            .is_active(&feature_set::validator_admission_ticket::id())
-        {
+        if feature_snapshot.validator_admission_ticket {
             self.stakes_cache
                 .stakes()
                 .clone_and_filter_for_vat(MAX_ALPENGLOW_VOTE_ACCOUNTS, minimum_vote_account_balance)

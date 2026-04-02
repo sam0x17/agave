@@ -180,6 +180,11 @@ pub(super) struct SigVerifyCertStats {
     pub(super) certs_to_sig_verify: u64,
     /// Number of certs [`verify_and_send_certificates`] successfully verified the signature of.
     pub(super) sig_verified_certs: u64,
+    /// Number of certs that were verified unnecessarily because another cert of the same
+    /// `CertificateType` was already verified.
+    pub(super) unnecessary_certs_verified: u64,
+    /// Number of times we are banning a validator that was already banned.
+    pub(super) already_banned: u64,
 
     /// Number of times stake verification failed on a cert.
     pub(super) stake_verification_failed: u64,
@@ -202,6 +207,8 @@ impl SigVerifyCertStats {
         let Self {
             certs_to_sig_verify,
             sig_verified_certs,
+            unnecessary_certs_verified,
+            already_banned,
             stake_verification_failed,
             signature_verification_failed,
             too_far_in_future,
@@ -211,6 +218,8 @@ impl SigVerifyCertStats {
         } = other;
         self.certs_to_sig_verify += certs_to_sig_verify;
         self.sig_verified_certs += sig_verified_certs;
+        self.unnecessary_certs_verified += unnecessary_certs_verified;
+        self.already_banned += already_banned;
         self.stake_verification_failed += stake_verification_failed;
         self.signature_verification_failed += signature_verification_failed;
         self.too_far_in_future += too_far_in_future;
@@ -224,6 +233,8 @@ impl SigVerifyCertStats {
         let Self {
             certs_to_sig_verify,
             sig_verified_certs,
+            unnecessary_certs_verified,
+            already_banned,
             stake_verification_failed,
             signature_verification_failed,
             too_far_in_future,
@@ -235,6 +246,12 @@ impl SigVerifyCertStats {
             "bls_cert_sigverify_stats",
             ("certs_to_sig_verify", *certs_to_sig_verify, i64),
             ("sig_verified_certs", *sig_verified_certs, i64),
+            (
+                "unnecessary_certs_verified",
+                *unnecessary_certs_verified,
+                i64
+            ),
+            ("already_banned", *already_banned, i64),
             ("stake_verification_failed", *stake_verification_failed, i64),
             (
                 "signature_verification_failed",
@@ -269,6 +286,8 @@ pub(super) struct SigVerifyVoteStats {
 
     /// Number of times the cert was too far in the future and discarded.
     pub(super) too_far_in_future: u64,
+    /// Number of times we are banning a validator that was already banned.
+    pub(super) already_banned: u64,
 
     /// Number of votes sent successfully over the channel to metrics.
     pub(super) metrics_sent: u64,
@@ -304,6 +323,7 @@ impl SigVerifyVoteStats {
             votes_to_sig_verify,
             sig_verified_votes,
             too_far_in_future,
+            already_banned,
             metrics_sent,
             metrics_channel_full,
             rewards_sent,
@@ -320,6 +340,7 @@ impl SigVerifyVoteStats {
         self.votes_to_sig_verify += votes_to_sig_verify;
         self.sig_verified_votes += sig_verified_votes;
         self.too_far_in_future += too_far_in_future;
+        self.already_banned += already_banned;
         self.metrics_sent += metrics_sent;
         self.metrics_channel_full += metrics_channel_full;
         self.rewards_sent += rewards_sent;
@@ -342,6 +363,7 @@ impl SigVerifyVoteStats {
             votes_to_sig_verify,
             sig_verified_votes,
             too_far_in_future,
+            already_banned,
             metrics_sent,
             metrics_channel_full,
             rewards_sent,
@@ -360,6 +382,7 @@ impl SigVerifyVoteStats {
             ("votes_to_sig_verify", *votes_to_sig_verify, i64),
             ("sig_verified_votes", *sig_verified_votes, i64),
             ("too_far_in_future", *too_far_in_future, i64),
+            ("already_banned", *already_banned, i64),
             ("metrics_sent", *metrics_sent, i64),
             ("metrics_channel_full", *metrics_channel_full, i64),
             ("rewards_sent", *rewards_sent, i64),

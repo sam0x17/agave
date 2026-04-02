@@ -50,6 +50,7 @@ use {
         cell::RefCell,
         fmt::{self, Debug},
         rc::Rc,
+        time::Duration,
     },
 };
 
@@ -206,8 +207,8 @@ pub struct InvokeContext<'a, 'ix_data> {
     /// the designated compute budget during program execution.
     compute_meter: RefCell<u64>,
     log_collector: Option<Rc<RefCell<LogCollector>>>,
-    /// Latest measurement not yet accumulated in [ExecuteDetailsTimings::execute_us]
-    pub execute_time: Option<Measure>,
+    /// Time spent so far executing nested program calls.
+    pub total_nested_exec_time: Duration,
     pub timings: ExecuteDetailsTimings,
     pub syscall_context: Vec<Option<SyscallContext>>,
     /// Pairs of index in TX instruction trace and VM register trace
@@ -234,7 +235,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             compute_budget,
             execution_cost,
             compute_meter: RefCell::new(compute_budget.compute_unit_limit),
-            execute_time: None,
+            total_nested_exec_time: Duration::ZERO,
             timings: ExecuteDetailsTimings::default(),
             syscall_context: Vec::new(),
             register_traces: Vec::new(),
@@ -1084,7 +1085,10 @@ pub fn mock_process_instruction<F: FnMut(&mut InvokeContext), G: FnMut(&mut Invo
 mod tests {
     use {
         super::*,
-        crate::execution_budget::DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT,
+        crate::execution_budget::{
+            DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT, MAX_INSTRUCTION_STACK_DEPTH,
+            MAX_INSTRUCTION_STACK_DEPTH_SIMD_0268,
+        },
         serde::{Deserialize, Serialize},
         solana_account::Account,
         solana_keypair::Keypair,
@@ -1092,6 +1096,7 @@ mod tests {
         solana_sbpf::program::BuiltinFunctionDefinition,
         solana_sdk_ids::system_program,
         solana_signer::Signer,
+        solana_svm_feature_set::SVMFeatureSet,
         solana_transaction::{Transaction, sanitized::SanitizedTransaction},
         solana_transaction_context::MAX_ACCOUNTS_PER_INSTRUCTION,
         test_case::test_case,
@@ -1217,18 +1222,32 @@ mod tests {
     #[test_case(false; "SIMD-0268 disabled")]
     #[test_case(true; "SIMD-0268 enabled")]
     fn test_instruction_stack_height(simd_0268_active: bool) {
-        let one_more_than_max_depth =
-            SVMTransactionExecutionBudget::new_with_defaults(simd_0268_active)
-                .max_instruction_stack_depth
-                .saturating_add(1);
+        let feature_set = &SVMFeatureSet {
+            raise_cpi_nesting_limit_to_8: simd_0268_active,
+            ..SVMFeatureSet::all_enabled()
+        };
+        let max_depth = SVMTransactionExecutionBudget::new_with_defaults(simd_0268_active)
+            .max_instruction_stack_depth;
+        assert_eq!(
+            max_depth,
+            if simd_0268_active {
+                MAX_INSTRUCTION_STACK_DEPTH_SIMD_0268
+            } else {
+                MAX_INSTRUCTION_STACK_DEPTH
+            },
+        );
+
+        // Set up max_depth + 1 accounts (one extra to trigger the failing push)
+        // and a matching program account for each.
         let mut invoke_stack = vec![];
         let mut transaction_accounts = vec![];
         let mut instruction_accounts = vec![];
-        for index in 0..one_more_than_max_depth {
-            invoke_stack.push(solana_pubkey::new_rand());
+        for index in 0..max_depth.saturating_add(1) {
+            let program_id = solana_pubkey::new_rand();
+            invoke_stack.push(program_id);
             transaction_accounts.push((
                 solana_pubkey::new_rand(),
-                AccountSharedData::new(index as u64, 1, invoke_stack.get(index).unwrap()),
+                AccountSharedData::new(1, 1, &program_id),
             ));
             instruction_accounts.push(InstructionAccount::new(
                 index as IndexOfAccount,
@@ -1236,6 +1255,10 @@ mod tests {
                 true,
             ));
         }
+
+        // Append program accounts after the regular accounts so that
+        // `first_program_account + depth` indexes the right program.
+        let first_program_account = transaction_accounts.len();
         for (index, program_id) in invoke_stack.iter().enumerate() {
             transaction_accounts.push((
                 *program_id,
@@ -1247,26 +1270,44 @@ mod tests {
                 false,
             ));
         }
-        with_mock_invoke_context!(invoke_context, transaction_context, transaction_accounts);
+        with_mock_invoke_context_with_feature_set!(
+            invoke_context,
+            transaction_context,
+            feature_set,
+            transaction_accounts,
+        );
 
-        // Check call depth increases and has a limit
-        let mut depth_reached: usize = 0;
-        for _ in 0..invoke_stack.len() {
+        // Each push must succeed and the stack height must track.
+        for depth in 0..max_depth {
+            assert_eq!(invoke_context.get_stack_height(), depth);
             invoke_context
                 .transaction_context
                 .configure_top_level_instruction_for_tests(
-                    one_more_than_max_depth.saturating_add(depth_reached) as IndexOfAccount,
+                    (first_program_account.saturating_add(depth)) as IndexOfAccount,
                     instruction_accounts.clone(),
                     vec![],
                 )
                 .unwrap();
-            if Err(InstructionError::CallDepth) == invoke_context.push() {
-                break;
-            }
-            depth_reached = depth_reached.saturating_add(1);
+            assert!(
+                invoke_context.push().is_ok(),
+                "push at depth {depth} should succeed (max_depth={max_depth})",
+            );
         }
-        assert_ne!(depth_reached, 0);
-        assert!(depth_reached < one_more_than_max_depth);
+
+        // At exactly max_depth, one more push must fail with CallDepth.
+        assert_eq!(invoke_context.get_stack_height(), max_depth);
+        invoke_context
+            .transaction_context
+            .configure_top_level_instruction_for_tests(
+                (first_program_account.saturating_add(max_depth)) as IndexOfAccount,
+                instruction_accounts.clone(),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(invoke_context.push(), Err(InstructionError::CallDepth),);
+
+        // Stack height must not have changed after the rejected push.
+        assert_eq!(invoke_context.get_stack_height(), max_depth);
     }
 
     #[test]
