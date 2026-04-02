@@ -8,12 +8,13 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────┐
-//! │ Header (20 bytes, naturally aligned)                │
+//! │ Header (32 bytes)                                   │
 //! │   version: u32          — format version (1)        │
 //! │   num_leader_spans: u32                             │
 //! │   epoch: u64                                        │
 //! │   num_leaders: u16                                  │
 //! │   slots_per_span: u16                               │
+//! │   _reserved: [u8; 12]   — must be zero              │
 //! ├─────────────────────────────────────────────────────┤
 //! │ Identity Table (num_leaders × 64 bytes)             │
 //! │   entries: [(Pubkey, Pubkey); num_leaders]           │
@@ -30,8 +31,8 @@ use {crate::SlotLeader, solana_clock::Epoch, solana_pubkey::Pubkey, std::collect
 /// Current format version.
 pub const VERSION: u32 = 1;
 
-/// Size of the fixed header in bytes (naturally aligned, no padding).
-pub const HEADER_SIZE: usize = 20;
+/// Size of the fixed header in bytes (padded to 32 for identity table alignment).
+pub const HEADER_SIZE: usize = 32;
 
 /// Size of one identity table entry: (identity Pubkey, vote account Pubkey).
 pub const IDENTITY_ENTRY_SIZE: usize = 64;
@@ -70,7 +71,8 @@ pub fn serialize_leader_schedule(
         HEADER_SIZE + num_leaders * IDENTITY_ENTRY_SIZE + num_leader_spans * SCHEDULE_INDEX_SIZE;
     let mut data = vec![0u8; data_len];
 
-    // Write header (naturally aligned, no padding).
+    // Write header (32 bytes, padded for identity table alignment).
+    // Reserved bytes [20..32] are left as zero from the vec![0u8; ..] init.
     data[0..4].copy_from_slice(&VERSION.to_le_bytes());
     data[4..8].copy_from_slice(&(num_leader_spans as u32).to_le_bytes());
     data[8..16].copy_from_slice(&epoch.to_le_bytes());
@@ -375,8 +377,8 @@ mod tests {
         let expected_size =
             HEADER_SIZE + num_validators * IDENTITY_ENTRY_SIZE + num_spans * SCHEDULE_INDEX_SIZE;
 
-        // 20 + 128000 + 216000 = 344020 bytes ≈ 336 KB
-        assert_eq!(expected_size, 344_020);
+        // 32 + 128000 + 216000 = 344032 bytes ≈ 336 KB
+        assert_eq!(expected_size, 344_032);
         assert!(expected_size < 10 * 1024 * 1024); // well under 10MB limit
     }
 
