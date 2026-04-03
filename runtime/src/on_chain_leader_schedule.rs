@@ -8,8 +8,12 @@ use {
     crate::bank::Bank,
     solana_account::AccountSharedData,
     solana_clock::Epoch,
-    solana_leader_schedule::{NUM_CONSECUTIVE_LEADER_SLOTS, on_chain as format},
+    solana_hash::Hash,
+    solana_leader_schedule::{
+        NUM_CONSECUTIVE_LEADER_SLOTS, epoch_stakes_on_chain as stakes_format, on_chain as format,
+    },
     solana_pubkey::Pubkey,
+    solana_sha256_hasher::Hasher,
     std::sync::LazyLock,
 };
 
@@ -38,7 +42,81 @@ pub static NEXT_SCHEDULE_ADDR: LazyLock<Pubkey> = LazyLock::new(|| {
     pubkey
 });
 
-/// Compute and store the leader schedule for a given epoch into `dest_addr`.
+/// PDA for the previous epoch's epoch stakes account.
+pub static PREVIOUS_EPOCH_STAKES_ADDR: LazyLock<Pubkey> = LazyLock::new(|| {
+    let (pubkey, _) = Pubkey::find_program_address(
+        &[b"previous_epoch_stakes"],
+        &solana_leader_schedule_program::id(),
+    );
+    pubkey
+});
+
+/// PDA for the current epoch's epoch stakes account.
+pub static CURRENT_EPOCH_STAKES_ADDR: LazyLock<Pubkey> = LazyLock::new(|| {
+    let (pubkey, _) = Pubkey::find_program_address(
+        &[b"current_epoch_stakes"],
+        &solana_leader_schedule_program::id(),
+    );
+    pubkey
+});
+
+/// PDA for the next epoch's epoch stakes account.
+pub static NEXT_EPOCH_STAKES_ADDR: LazyLock<Pubkey> = LazyLock::new(|| {
+    let (pubkey, _) = Pubkey::find_program_address(
+        &[b"next_epoch_stakes"],
+        &solana_leader_schedule_program::id(),
+    );
+    pubkey
+});
+
+/// Helper to create and store an account with data owned by the leader schedule program.
+fn store_program_account(bank: &Bank, dest_addr: &Pubkey, data: &[u8]) {
+    let lamports = bank
+        .rent_collector()
+        .rent
+        .minimum_balance(data.len())
+        .max(1);
+    let mut account =
+        AccountSharedData::new(lamports, data.len(), &solana_leader_schedule_program::id());
+    account.set_data_from_slice(data);
+    bank.store_account_and_update_capitalization(dest_addr, &account);
+}
+
+/// Compute the SHA-256 hash of epoch stakes for inclusion in the leader schedule header.
+/// Hashes the sorted (vote_pubkey, stake) pairs in deterministic order.
+fn compute_epoch_stakes_hash(
+    vote_accounts: &solana_vote::vote_account::VoteAccountsHashMap,
+) -> Hash {
+    let mut sorted_stakes: Vec<_> = vote_accounts
+        .iter()
+        .map(|(pubkey, (stake, _))| (*pubkey, *stake))
+        .collect();
+    sorted_stakes.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = Hasher::default();
+    for (pubkey, stake) in &sorted_stakes {
+        hasher.hash(pubkey.as_ref());
+        hasher.hash(&stake.to_le_bytes());
+    }
+    hasher.result()
+}
+
+/// Serialize and store the epoch stakes for a given epoch.
+fn write_epoch_stakes_account(bank: &Bank, epoch: Epoch, dest_addr: &Pubkey) {
+    let Some(vote_accounts) = bank.epoch_vote_accounts(epoch) else {
+        return;
+    };
+
+    let stakes: Vec<_> = vote_accounts
+        .iter()
+        .map(|(pubkey, (stake, _))| (*pubkey, *stake))
+        .collect();
+
+    let data = stakes_format::serialize_epoch_stakes(&stakes, epoch);
+    store_program_account(bank, dest_addr, &data);
+}
+
+/// Compute and store the leader schedule for a given epoch.
 fn write_schedule_account(bank: &Bank, epoch: Epoch, dest_addr: &Pubkey) {
     let Some(vote_accounts) = bank.epoch_vote_accounts(epoch) else {
         return;
@@ -61,18 +139,16 @@ fn write_schedule_account(bank: &Bank, epoch: Epoch, dest_addr: &Pubkey) {
     );
 
     // Extract SlotLeader pairs (identity + vote address) per slot.
-    let slot_leaders: Vec<_> = schedule.get_slot_leaders().to_vec();
+    let slot_leaders: Vec<_> = schedule.get_slot_leaders().copied().collect();
 
-    let data = format::serialize_leader_schedule(&slot_leaders, epoch, slots_per_span.get());
-    let lamports = bank
-        .rent_collector()
-        .rent
-        .minimum_balance(data.len())
-        .max(1);
-    let mut account =
-        AccountSharedData::new(lamports, data.len(), &solana_leader_schedule_program::id());
-    account.set_data_from_slice(&data);
-    bank.store_account_and_update_capitalization(dest_addr, &account);
+    let epoch_stakes_hash = compute_epoch_stakes_hash(vote_accounts);
+    let data = format::serialize_leader_schedule(
+        &slot_leaders,
+        epoch,
+        slots_per_span.get(),
+        &epoch_stakes_hash,
+    );
+    store_program_account(bank, dest_addr, &data);
 }
 
 /// Update the on-chain leader schedule accounts at an epoch boundary.
@@ -89,25 +165,42 @@ pub(crate) fn update_on_chain_leader_schedule(bank: &Bank) {
     if is_bootstrap {
         // First activation: populate current. Only populate next if
         // vote accounts for that epoch are already available.
-        // Previous is left empty (no prior epoch data available).
+        // Previous accounts are left empty (no prior epoch data available).
         write_schedule_account(bank, current_epoch, &CURRENT_SCHEDULE_ADDR);
+        write_epoch_stakes_account(bank, current_epoch, &CURRENT_EPOCH_STAKES_ADDR);
         if bank.epoch_vote_accounts(next_epoch).is_some() {
             write_schedule_account(bank, next_epoch, &NEXT_SCHEDULE_ADDR);
+            write_epoch_stakes_account(bank, next_epoch, &NEXT_EPOCH_STAKES_ADDR);
         }
     } else {
-        // Rotate: current -> previous, next -> current, compute new next.
+        // Rotate both account sets: current -> previous, next -> current.
         if let Some(current_account) = bank.get_account(&CURRENT_SCHEDULE_ADDR) {
             bank.store_account_and_update_capitalization(&PREVIOUS_SCHEDULE_ADDR, &current_account);
+        }
+        if let Some(current_stakes) = bank.get_account(&CURRENT_EPOCH_STAKES_ADDR) {
+            bank.store_account_and_update_capitalization(
+                &PREVIOUS_EPOCH_STAKES_ADDR,
+                &current_stakes,
+            );
         }
 
         if let Some(next_account) = bank.get_account(&NEXT_SCHEDULE_ADDR) {
             bank.store_account_and_update_capitalization(&CURRENT_SCHEDULE_ADDR, &next_account);
         } else {
-            // next_schedule wasn't populated yet (edge case after bootstrap
-            // when next epoch data wasn't available). Compute current directly.
             write_schedule_account(bank, current_epoch, &CURRENT_SCHEDULE_ADDR);
         }
+        if let Some(next_stakes) = bank.get_account(&NEXT_EPOCH_STAKES_ADDR) {
+            bank.store_account_and_update_capitalization(
+                &CURRENT_EPOCH_STAKES_ADDR,
+                &next_stakes,
+            );
+        } else {
+            write_epoch_stakes_account(bank, current_epoch, &CURRENT_EPOCH_STAKES_ADDR);
+        }
+
+        // Compute new next epoch data.
         write_schedule_account(bank, next_epoch, &NEXT_SCHEDULE_ADDR);
+        write_epoch_stakes_account(bank, next_epoch, &NEXT_EPOCH_STAKES_ADDR);
     }
 }
 

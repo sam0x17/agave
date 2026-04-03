@@ -136,19 +136,32 @@ impl ReservedAccount {
 }
 
 // Leader schedule program ID and PDA addresses.
-// PDAs are derived from seeds ["previous_schedule"], ["current_schedule"],
-// and ["next_schedule"] with the leader schedule program as the base.
+// PDAs are derived from the leader schedule program with fixed seed strings.
 mod leader_schedule_ids {
     use solana_pubkey::Pubkey;
 
     pub const PROGRAM_ID: Pubkey =
         Pubkey::from_str_const("8WDMPtpgHx5Xj3AJR2LMyXoD6ci2xDcT6GpJtAHZJwdW");
+    // Leader schedule account PDAs
     pub const PREVIOUS_SCHEDULE: Pubkey =
         Pubkey::from_str_const("5C6Q9J6Kha4Cbv98aPFgWDi88Py3ZazdbZFNZykFPu3X");
     pub const CURRENT_SCHEDULE: Pubkey =
         Pubkey::from_str_const("7yJfSmGSR1m4Xy6JVvxufauQWo7oEqrHVsjWiAS8hSpD");
     pub const NEXT_SCHEDULE: Pubkey =
         Pubkey::from_str_const("9RXx9Z8EcmAnv3LMHk8GLzM5wsyUT8G4YoVfiqsURGMN");
+    // Epoch stakes account PDAs
+    pub static PREVIOUS_EPOCH_STAKES: std::sync::LazyLock<Pubkey> =
+        std::sync::LazyLock::new(|| {
+            Pubkey::find_program_address(&[b"previous_epoch_stakes"], &PROGRAM_ID).0
+        });
+    pub static CURRENT_EPOCH_STAKES: std::sync::LazyLock<Pubkey> =
+        std::sync::LazyLock::new(|| {
+            Pubkey::find_program_address(&[b"current_epoch_stakes"], &PROGRAM_ID).0
+        });
+    pub static NEXT_EPOCH_STAKES: std::sync::LazyLock<Pubkey> =
+        std::sync::LazyLock::new(|| {
+            Pubkey::find_program_address(&[b"next_epoch_stakes"], &PROGRAM_ID).0
+        });
 }
 
 // New reserved accounts should be added in alphabetical order and must specify
@@ -209,6 +222,19 @@ static RESERVED_ACCOUNTS: std::sync::LazyLock<Vec<ReservedAccount>> =
             ),
             ReservedAccount::new_pending(
                 leader_schedule_ids::NEXT_SCHEDULE,
+                agave_feature_set::on_chain_leader_schedule::id(),
+            ),
+            // epoch stakes accounts
+            ReservedAccount::new_pending(
+                *leader_schedule_ids::PREVIOUS_EPOCH_STAKES,
+                agave_feature_set::on_chain_leader_schedule::id(),
+            ),
+            ReservedAccount::new_pending(
+                *leader_schedule_ids::CURRENT_EPOCH_STAKES,
+                agave_feature_set::on_chain_leader_schedule::id(),
+            ),
+            ReservedAccount::new_pending(
+                *leader_schedule_ids::NEXT_EPOCH_STAKES,
                 agave_feature_set::on_chain_leader_schedule::id(),
             ),
         ]

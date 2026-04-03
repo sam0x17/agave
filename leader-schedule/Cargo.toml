@@ -24,6 +24,7 @@ agave-random = { workspace = true }
 itertools = { workspace = true }
 rand_chacha = { workspace = true }
 solana-clock = { workspace = true }
+solana-hash = { workspace = true }
 solana-pubkey = { workspace = true, features = ["rand"] }
 solana-vote = { workspace = true }
 

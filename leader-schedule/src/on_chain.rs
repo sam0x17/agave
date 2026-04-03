@@ -8,13 +8,14 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────┐
-//! │ Header (32 bytes)                                   │
-//! │   version: u32          — format version (1)        │
+//! │ Header (64 bytes)                                   │
+//! │   version: u32              — format version (1)    │
 //! │   num_leader_spans: u32                             │
 //! │   epoch: u64                                        │
 //! │   num_leaders: u16                                  │
 //! │   slots_per_span: u16                               │
-//! │   _reserved: [u8; 12]   — must be zero              │
+//! │   _reserved: [u8; 12]       — must be zero          │
+//! │   epoch_stakes_hash: [u8; 32] — SHA-256 of input    │
 //! ├─────────────────────────────────────────────────────┤
 //! │ Identity Table (num_leaders × 64 bytes)             │
 //! │   entries: [(Pubkey, Pubkey); num_leaders]           │
@@ -26,13 +27,23 @@
 //! └─────────────────────────────────────────────────────┘
 //! ```
 
-use {crate::SlotLeader, solana_clock::Epoch, solana_pubkey::Pubkey, std::collections::HashMap};
+use {
+    crate::SlotLeader,
+    solana_clock::Epoch,
+    solana_hash::Hash,
+    solana_pubkey::Pubkey,
+    std::collections::HashMap,
+};
 
 /// Current format version.
 pub const VERSION: u32 = 1;
 
-/// Size of the fixed header in bytes (padded to 32 for identity table alignment).
-pub const HEADER_SIZE: usize = 32;
+/// Size of the fixed header in bytes (64 = 20 data + 12 reserved + 32 hash).
+/// Identity table starts at offset 64, aligned to 32 bytes.
+pub const HEADER_SIZE: usize = 64;
+
+/// Offset of the epoch_stakes_hash field within the header.
+const EPOCH_STAKES_HASH_OFFSET: usize = 32;
 
 /// Size of one identity table entry: (identity Pubkey, vote account Pubkey).
 pub const IDENTITY_ENTRY_SIZE: usize = 64;
@@ -46,10 +57,15 @@ pub const SCHEDULE_INDEX_SIZE: usize = 2;
 /// leader (currently `NUM_CONSECUTIVE_LEADER_SLOTS`, i.e. 4). It is stored
 /// in the header so consumers can decode the schedule without hardcoding
 /// the constant.
+///
+/// `epoch_stakes_hash` is the SHA-256 hash of the epoch stakes that were
+/// input to the leader schedule computation, allowing consumers to verify
+/// the schedule was derived from the expected stake distribution.
 pub fn serialize_leader_schedule(
     slot_leaders: &[SlotLeader],
     epoch: Epoch,
     slots_per_span: usize,
+    epoch_stakes_hash: &Hash,
 ) -> Vec<u8> {
     // Build sorted, deduplicated identity table and index map.
     // Each entry is an (identity, vote_account) pair.
@@ -71,13 +87,15 @@ pub fn serialize_leader_schedule(
         HEADER_SIZE + num_leaders * IDENTITY_ENTRY_SIZE + num_leader_spans * SCHEDULE_INDEX_SIZE;
     let mut data = vec![0u8; data_len];
 
-    // Write header (32 bytes, padded for identity table alignment).
-    // Reserved bytes [20..32] are left as zero from the vec![0u8; ..] init.
+    // Write header (64 bytes). Reserved bytes [20..32] are left as zero
+    // from the vec![0u8; ..] init. Hash occupies [32..64].
     data[0..4].copy_from_slice(&VERSION.to_le_bytes());
     data[4..8].copy_from_slice(&(num_leader_spans as u32).to_le_bytes());
     data[8..16].copy_from_slice(&epoch.to_le_bytes());
     data[16..18].copy_from_slice(&(num_leaders as u16).to_le_bytes());
     data[18..20].copy_from_slice(&(slots_per_span as u16).to_le_bytes());
+    data[EPOCH_STAKES_HASH_OFFSET..EPOCH_STAKES_HASH_OFFSET + 32]
+        .copy_from_slice(epoch_stakes_hash.as_ref());
 
     // Write identity table: (identity, vote_account) pairs.
     let identities_start = HEADER_SIZE;
@@ -108,6 +126,7 @@ pub struct LeaderScheduleHeader {
     pub epoch: Epoch,
     pub num_leaders: u16,
     pub slots_per_span: u16,
+    pub epoch_stakes_hash: Hash,
 }
 
 /// Deserialize the header from raw account data.
@@ -126,6 +145,12 @@ pub fn deserialize_header(data: &[u8]) -> Option<LeaderScheduleHeader> {
     let epoch = u64::from_le_bytes(data[8..16].try_into().ok()?);
     let num_leaders = u16::from_le_bytes(data[16..18].try_into().ok()?);
     let slots_per_span = u16::from_le_bytes(data[18..20].try_into().ok()?);
+    let epoch_stakes_hash = Hash::new_from_array(
+        <[u8; 32]>::try_from(
+            &data[EPOCH_STAKES_HASH_OFFSET..EPOCH_STAKES_HASH_OFFSET + 32],
+        )
+        .ok()?,
+    );
 
     if slots_per_span == 0 {
         return None;
@@ -144,6 +169,7 @@ pub fn deserialize_header(data: &[u8]) -> Option<LeaderScheduleHeader> {
         epoch,
         num_leaders,
         slots_per_span,
+        epoch_stakes_hash,
     })
 }
 
@@ -207,6 +233,7 @@ mod tests {
     use super::*;
 
     const SLOTS_PER_SPAN: usize = 4;
+    const TEST_HASH: Hash = Hash::new_from_array([0xAB; 32]);
 
     fn make_slot_leader(id: Pubkey) -> SlotLeader {
         SlotLeader {
@@ -230,7 +257,7 @@ mod tests {
         ];
 
         let epoch = 42;
-        let data = serialize_leader_schedule(&slot_leaders, epoch, SLOTS_PER_SPAN);
+        let data = serialize_leader_schedule(&slot_leaders, epoch, SLOTS_PER_SPAN, &TEST_HASH);
 
         let header = deserialize_header(&data).unwrap();
         assert_eq!(header.version, VERSION);
@@ -238,6 +265,7 @@ mod tests {
         assert_eq!(header.epoch, epoch);
         assert_eq!(header.num_leaders, 3);
         assert_eq!(header.slots_per_span, 4);
+        assert_eq!(header.epoch_stakes_hash, TEST_HASH);
 
         // Verify entries are sorted by identity
         let entries = get_identity_entries(&data).unwrap();
@@ -284,7 +312,7 @@ mod tests {
     fn test_single_leader() {
         let leader = make_slot_leader(Pubkey::new_unique());
         let slot_leaders = vec![leader; 8]; // 2 spans
-        let data = serialize_leader_schedule(&slot_leaders, 100, SLOTS_PER_SPAN);
+        let data = serialize_leader_schedule(&slot_leaders, 100, SLOTS_PER_SPAN, &TEST_HASH);
 
         let header = deserialize_header(&data).unwrap();
         assert_eq!(header.num_leaders, 1);
@@ -310,7 +338,7 @@ mod tests {
             leader_a, leader_a, leader_a, leader_a, // span 0
             leader_b, leader_b, leader_b, leader_b, // span 1
         ];
-        let data = serialize_leader_schedule(&slot_leaders, 1, SLOTS_PER_SPAN);
+        let data = serialize_leader_schedule(&slot_leaders, 1, SLOTS_PER_SPAN, &TEST_HASH);
 
         let header = deserialize_header(&data).unwrap();
         // Two distinct entries even though same identity
@@ -333,7 +361,7 @@ mod tests {
             leaders[0], leaders[0], // span 0 (2 slots)
             leaders[1], leaders[1], // span 1 (2 slots)
         ];
-        let data = serialize_leader_schedule(&slot_leaders, 1, 2);
+        let data = serialize_leader_schedule(&slot_leaders, 1, 2, &TEST_HASH);
 
         let header = deserialize_header(&data).unwrap();
         assert_eq!(header.slots_per_span, 2);
@@ -361,7 +389,7 @@ mod tests {
     fn test_unknown_version_returns_none() {
         let leader = make_slot_leader(Pubkey::new_unique());
         let slot_leaders = vec![leader; 4];
-        let mut data = serialize_leader_schedule(&slot_leaders, 0, SLOTS_PER_SPAN);
+        let mut data = serialize_leader_schedule(&slot_leaders, 0, SLOTS_PER_SPAN, &TEST_HASH);
 
         // Overwrite version to 99
         data[0..4].copy_from_slice(&99u32.to_le_bytes());
@@ -377,8 +405,8 @@ mod tests {
         let expected_size =
             HEADER_SIZE + num_validators * IDENTITY_ENTRY_SIZE + num_spans * SCHEDULE_INDEX_SIZE;
 
-        // 32 + 128000 + 216000 = 344032 bytes ≈ 336 KB
-        assert_eq!(expected_size, 344_032);
+        // 64 + 128000 + 216000 = 344064 bytes ≈ 336 KB
+        assert_eq!(expected_size, 344_064);
         assert!(expected_size < 10 * 1024 * 1024); // well under 10MB limit
     }
 
@@ -393,7 +421,7 @@ mod tests {
     fn test_truncated_data_returns_none() {
         let leader = make_slot_leader(Pubkey::new_unique());
         let slot_leaders = vec![leader; 4];
-        let data = serialize_leader_schedule(&slot_leaders, 0, SLOTS_PER_SPAN);
+        let data = serialize_leader_schedule(&slot_leaders, 0, SLOTS_PER_SPAN, &TEST_HASH);
 
         // Truncate the data
         assert!(deserialize_header(&data[..data.len() - 1]).is_none());

@@ -8680,6 +8680,7 @@ dependencies = [
  "rand_chacha 0.9.0",
  "sha2 0.10.9",
  "solana-clock",
+ "solana-hash 4.2.0",
  "solana-pubkey 4.1.0",
  "solana-vote",
  "test-case",
