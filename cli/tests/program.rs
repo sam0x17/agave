@@ -1,7 +1,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use {
-    agave_feature_set::enable_alt_bn128_syscall,
+    agave_feature_set::{enable_alt_bn128_syscall, enable_extend_program_checked},
     assert_matches::assert_matches,
     serde_json::Value,
     solana_account::{ReadableAccount, state_traits::StateMut},
@@ -18,7 +18,10 @@ use {
     solana_faucet::faucet::run_local_faucet_with_unique_port_for_tests,
     solana_fee_calculator::FeeRateGovernor,
     solana_keypair::Keypair,
-    solana_loader_v3_interface::state::UpgradeableLoaderState,
+    solana_loader_v3_interface::{
+        instruction as loader_v3_instruction, state::UpgradeableLoaderState,
+    },
+    solana_message::Message,
     solana_net_utils::SocketAddrSpace,
     solana_pubkey::Pubkey,
     solana_rent::Rent,
@@ -56,7 +59,8 @@ fn test_validator_genesis(mint_keypair: &Keypair) -> TestValidatorGenesis {
         })
         .faucet_addr(Some(run_local_faucet_with_unique_port_for_tests(
             mint_keypair.insecure_clone(),
-        )));
+        )))
+        .deactivate_features(&[enable_extend_program_checked::id()]);
     genesis
 }
 
@@ -135,10 +139,11 @@ async fn test_cli_program_deploy_non_upgradeable() {
         .unwrap();
 
     let keypair = Keypair::new();
+    let fee_headroom = 1_000_000;
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
-        lamports: 4 * minimum_balance_for_programdata, // min balance for rent exemption for three programs + leftover for tx processing
+        lamports: 4 * minimum_balance_for_programdata + fee_headroom,
     };
     process_command(&config).await.unwrap();
 
@@ -753,7 +758,7 @@ async fn test_cli_program_deploy_with_authority() {
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
-        lamports: 100 * minimum_balance_for_programdata + minimum_balance_for_program,
+        lamports: 1000 * minimum_balance_for_programdata + minimum_balance_for_program,
     };
     process_command(&config).await.unwrap();
 
@@ -1164,10 +1169,13 @@ async fn test_cli_program_upgrade_auto_extend(skip_preflight: bool) {
     let upgrade_authority = Keypair::new();
 
     let keypair = Keypair::new();
+    let fee_headroom = 100_000;
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
-        lamports: 100 * minimum_balance_for_programdata + minimum_balance_for_program,
+        lamports: 100 * minimum_balance_for_programdata
+            + minimum_balance_for_program
+            + fee_headroom,
     };
     process_command(&config).await.unwrap();
 
@@ -1328,10 +1336,13 @@ async fn test_cli_program_close_program() {
     let upgrade_authority = Keypair::new();
 
     let keypair = Keypair::new();
+    let fee_headroom = 1_000_000;
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
-        lamports: 100 * minimum_balance_for_programdata + minimum_balance_for_program,
+        lamports: 100 * minimum_balance_for_programdata
+            + minimum_balance_for_program
+            + fee_headroom,
     };
     process_command(&config).await.unwrap();
 
@@ -1450,10 +1461,13 @@ async fn test_cli_program_extend_program() {
     let upgrade_authority = Keypair::new();
 
     let keypair = Keypair::new();
+    let fee_headroom = 1_000_000;
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
-        lamports: 100 * minimum_balance_for_programdata + minimum_balance_for_program,
+        lamports: 100 * minimum_balance_for_programdata
+            + minimum_balance_for_program
+            + fee_headroom,
     };
     config.send_transaction_config = RpcSendTransactionConfig {
         skip_preflight: false,
@@ -1503,10 +1517,9 @@ async fn test_cli_program_extend_program() {
     file.read_to_end(&mut new_program_data).unwrap();
     let new_max_len = new_program_data.len();
     let additional_bytes = (new_max_len - max_len) as u32;
-    config.signers = vec![&keypair, &upgrade_authority];
-    config.command = CliCommand::Program(ProgramCliCommand::ExtendProgramChecked {
+    config.signers = vec![&keypair];
+    config.command = CliCommand::Program(ProgramCliCommand::ExtendProgram {
         program_pubkey: program_keypair.pubkey(),
-        authority_signer_index: 1,
         payer_signer_index: 0,
         additional_bytes: additional_bytes - 1,
     });
@@ -1558,10 +1571,9 @@ async fn test_cli_program_extend_program() {
     wait_n_slots(&rpc_client, 1).await;
 
     // Extend 1 last byte
-    config.signers = vec![&keypair, &upgrade_authority];
-    config.command = CliCommand::Program(ProgramCliCommand::ExtendProgramChecked {
+    config.signers = vec![&keypair];
+    config.command = CliCommand::Program(ProgramCliCommand::ExtendProgram {
         program_pubkey: program_keypair.pubkey(),
-        authority_signer_index: 1,
         payer_signer_index: 0,
         additional_bytes: 1,
     });
@@ -1606,11 +1618,10 @@ async fn test_cli_program_extend_program() {
     let programdata_account = rpc_client.get_account(&programdata_pubkey).await.unwrap();
     let prev_len = programdata_account.data.len();
 
-    config.signers = vec![&keypair, &upgrade_authority, &rent_payer];
-    config.command = CliCommand::Program(ProgramCliCommand::ExtendProgramChecked {
+    config.signers = vec![&keypair, &rent_payer];
+    config.command = CliCommand::Program(ProgramCliCommand::ExtendProgram {
         program_pubkey: program_keypair.pubkey(),
-        authority_signer_index: 1,
-        payer_signer_index: 2,
+        payer_signer_index: 1,
         additional_bytes: 1024,
     });
     process_command(&config).await.unwrap();
@@ -1939,6 +1950,20 @@ async fn test_cli_program_write_buffer() {
         .await
         .unwrap()
         .lamports;
+    let mut close_message = Message::new(
+        &[loader_v3_instruction::close_any(
+            &new_buffer_pubkey,
+            &keypair.pubkey(),
+            Some(&keypair.pubkey()),
+            None,
+        )],
+        Some(&keypair.pubkey()),
+    );
+    close_message.recent_blockhash = rpc_client.get_latest_blockhash().await.unwrap();
+    let close_fee = rpc_client
+        .get_fee_for_message(&close_message)
+        .await
+        .unwrap();
     config.signers = vec![&keypair];
     config.command = CliCommand::Program(ProgramCliCommand::Close {
         account_pubkey: Some(new_buffer_pubkey),
@@ -1956,7 +1981,7 @@ async fn test_cli_program_write_buffer() {
     .await;
     let recipient_account = rpc_client.get_account(&keypair.pubkey()).await.unwrap();
     assert_eq!(
-        pre_lamports + minimum_balance_for_buffer,
+        pre_lamports + minimum_balance_for_buffer - close_fee,
         recipient_account.lamports
     );
 

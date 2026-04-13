@@ -1,6 +1,6 @@
 #[cfg(feature = "dev-context-only-utils")]
 use {
-    crate::loaded_programs::ProgramCacheEntry,
+    crate::program_cache_entry::ProgramCacheEntry,
     solana_account::{AccountSharedData, WritableAccount, create_account_shared_data_for_test},
     solana_epoch_schedule::EpochSchedule,
     solana_instruction::AccountMeta,
@@ -13,9 +13,9 @@ use {
     crate::{
         execution_budget::{SVMTransactionExecutionBudget, SVMTransactionExecutionCost},
         loaded_programs::{
-            ProgramCacheEntryType, ProgramCacheForTxBatch, ProgramRuntimeEnvironment,
-            ProgramRuntimeEnvironments,
+            ProgramCacheForTxBatch, ProgramRuntimeEnvironment, ProgramRuntimeEnvironments,
         },
+        program_cache_entry::ProgramCacheEntryType,
         stable_log,
         sysvar_cache::SysvarCache,
     },
@@ -47,8 +47,9 @@ use {
     std::{
         alloc::Layout,
         borrow::Cow,
-        cell::RefCell,
+        cell::{Cell, RefCell},
         fmt::{self, Debug},
+        ptr,
         rc::Rc,
         time::Duration,
     },
@@ -72,7 +73,6 @@ macro_rules! declare_process_instruction {
                 _arg2: u64,
                 _arg3: u64,
                 _arg4: u64,
-                _memory_mapping: &mut $crate::solana_sbpf::memory_region::MemoryMapping,
             ) -> Result<u64, Box<dyn std::error::Error>> {
                 fn process_instruction_inner(
                     $invoke_context: &mut $crate::invoke_context::InvokeContext,
@@ -81,7 +81,7 @@ macro_rules! declare_process_instruction {
 
                 let consumption_result = if $cu_to_consume > 0
                 {
-                    invoke_context.consume_checked($cu_to_consume)
+                    invoke_context.compute_meter.consume_checked($cu_to_consume)
                 } else {
                     Ok(())
                 };
@@ -101,12 +101,22 @@ impl ContextObject for InvokeContext<'_, '_> {
     fn consume(&mut self, amount: u64) {
         // 1 to 1 instruction to compute unit mapping
         // ignore overflow, Ebpf will bail if exceeded
-        let mut compute_meter = self.compute_meter.borrow_mut();
-        *compute_meter = compute_meter.saturating_sub(amount);
+        let compute_meter = self.compute_meter.0.get();
+        self.compute_meter
+            .0
+            .set(compute_meter.saturating_sub(amount));
     }
 
     fn get_remaining(&self) -> u64 {
-        *self.compute_meter.borrow()
+        self.compute_meter.0.get()
+    }
+
+    fn active_mapping_ptr(&mut self) -> ptr::NonNull<MemoryMapping> {
+        let memory = self
+            .memory_contexts
+            .memory_mapping_mut()
+            .expect("The memory context must have been set for the current instruction");
+        ptr::NonNull::from_mut(memory)
     }
 }
 
@@ -175,11 +185,110 @@ impl<'a> EnvironmentConfig<'a> {
             sysvar_cache,
         }
     }
+
+    /// Get cached sysvars
+    pub fn sysvar_cache(&self) -> &SysvarCache {
+        self.sysvar_cache
+    }
 }
 
-pub struct SyscallContext {
+pub struct ComputeMeter(Cell<u64>);
+
+impl ComputeMeter {
+    /// Consume compute units
+    pub fn consume_checked(&self, amount: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let compute_meter = self.0.get();
+        let exceeded = compute_meter < amount;
+        self.0.set(compute_meter.saturating_sub(amount));
+        if exceeded {
+            return Err(Box::new(InstructionError::ComputationalBudgetExceeded));
+        }
+        Ok(())
+    }
+
+    /// Set compute units
+    ///
+    /// Only use for tests and benchmarks
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn mock_set_remaining(&self, remaining: u64) {
+        self.0.set(remaining);
+    }
+}
+
+pub struct MemoryContexts(Vec<MemoryContext>);
+
+impl MemoryContexts {
+    /// Set this instruction's [`MemoryContext`].
+    pub fn set_memory_context(
+        &mut self,
+        memory_context: MemoryContext,
+    ) -> Result<(), InstructionError> {
+        *self.0.last_mut().ok_or(InstructionError::CallDepth)? = memory_context;
+        Ok(())
+    }
+
+    /// Get current instruction's [`MemoryContext`]
+    pub fn memory_context(&self) -> Result<&MemoryContext, InstructionError> {
+        self.0.last().ok_or(InstructionError::CallDepth)
+    }
+
+    /// Get current instruction's [`MemoryContext`] for mutable use.
+    pub fn memory_context_mut(&mut self) -> Result<&mut MemoryContext, InstructionError> {
+        self.0.last_mut().ok_or(InstructionError::CallDepth)
+    }
+
+    pub fn memory_mapping(&self) -> Result<&MemoryMapping, InstructionError> {
+        let last_context = self.memory_context()?;
+        Ok(&last_context.memory_mapping)
+    }
+
+    pub fn memory_mapping_mut(&mut self) -> Result<&mut MemoryMapping, InstructionError> {
+        let last_context = self.memory_context_mut()?;
+        Ok(&mut last_context.memory_mapping)
+    }
+
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn mock_set_mapping(&mut self, memory_mapping: MemoryMapping) {
+        self.0 = vec![MemoryContext {
+            allocator: BpfAllocator::new(0),
+            accounts_metadata: vec![],
+            memory_mapping: Box::new(memory_mapping),
+        }];
+    }
+}
+
+/// This structure contains metadata about the memory for each instruction under execution.
+/// The BpfAllocator, accounts addresses in the guest and the memory mapping.
+pub struct MemoryContext {
     pub allocator: BpfAllocator,
     pub accounts_metadata: Vec<SerializedAccountMetadata>,
+    memory_mapping: Box<MemoryMapping>,
+}
+
+impl MemoryContext {
+    /// Creates a new memory context
+    pub fn new(
+        allocator: BpfAllocator,
+        accounts_metadata: Vec<SerializedAccountMetadata>,
+        memory_mapping: MemoryMapping,
+    ) -> Self {
+        Self {
+            allocator,
+            accounts_metadata,
+            memory_mapping: Box::new(memory_mapping),
+        }
+    }
+
+    /// Returns an empty dummy context used for builtin functions
+    pub(crate) fn empty() -> Self {
+        Self {
+            allocator: BpfAllocator::new(0),
+            accounts_metadata: Vec::new(),
+            memory_mapping: Box::new(
+                MemoryMapping::new(Vec::new(), &Config::default(), SBPFVersion::Reserved).unwrap(),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -205,12 +314,12 @@ pub struct InvokeContext<'a, 'ix_data> {
     execution_cost: SVMTransactionExecutionCost,
     /// Instruction compute meter, for tracking compute units consumed against
     /// the designated compute budget during program execution.
-    compute_meter: RefCell<u64>,
+    pub compute_meter: ComputeMeter,
     log_collector: Option<Rc<RefCell<LogCollector>>>,
     /// Time spent so far executing nested program calls.
     pub total_nested_exec_time: Duration,
     pub timings: ExecuteDetailsTimings,
-    pub syscall_context: Vec<Option<SyscallContext>>,
+    pub memory_contexts: MemoryContexts,
     /// Pairs of index in TX instruction trace and VM register trace
     register_traces: Vec<(usize, Vec<[u64; 12]>)>,
     /// Debug port to use for this executing transaction.
@@ -234,10 +343,10 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             log_collector,
             compute_budget,
             execution_cost,
-            compute_meter: RefCell::new(compute_budget.compute_unit_limit),
+            compute_meter: ComputeMeter(Cell::new(compute_budget.compute_unit_limit)),
             total_nested_exec_time: Duration::ZERO,
             timings: ExecuteDetailsTimings::default(),
-            syscall_context: Vec::new(),
+            memory_contexts: MemoryContexts(Vec::new()),
             register_traces: Vec::new(),
             #[cfg(feature = "sbpf-debugger")]
             debug_port: None,
@@ -271,13 +380,13 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             }
         }
 
-        self.syscall_context.push(None);
+        self.memory_contexts.0.push(MemoryContext::empty());
         self.transaction_context.push()
     }
 
     /// Pop a stack frame from the invocation stack
     pub(crate) fn pop(&mut self) -> Result<(), InstructionError> {
-        self.syscall_context.pop();
+        self.memory_contexts.0.pop();
         self.transaction_context.pop()
     }
 
@@ -582,9 +691,6 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         stable_log::program_invoke(&logger, &program_id, self.get_stack_height());
         let pre_remaining_units = self.get_remaining();
         // For now, only built-ins are invoked from here, so the VM and its Config are irrelevant.
-        let mock_config = Config::default();
-        let empty_memory_mapping =
-            MemoryMapping::new(Vec::new(), &mock_config, SBPFVersion::V0).unwrap();
         let mut vm = EbpfVm::new(
             Arc::clone(
                 &**self
@@ -595,7 +701,6 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             SBPFVersion::V0,
             // Removes lifetime tracking
             unsafe { std::mem::transmute::<&mut InvokeContext, &mut InvokeContext>(self) },
-            empty_memory_mapping,
             0,
         );
         vm.invoke_function(function);
@@ -639,24 +744,6 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         self.log_collector.clone()
     }
 
-    /// Consume compute units
-    pub fn consume_checked(&self, amount: u64) -> Result<(), Box<dyn std::error::Error>> {
-        let mut compute_meter = self.compute_meter.borrow_mut();
-        let exceeded = *compute_meter < amount;
-        *compute_meter = compute_meter.saturating_sub(amount);
-        if exceeded {
-            return Err(Box::new(InstructionError::ComputationalBudgetExceeded));
-        }
-        Ok(())
-    }
-
-    /// Set compute units
-    ///
-    /// Only use for tests and benchmarks
-    pub fn mock_set_remaining(&self, remaining: u64) {
-        *self.compute_meter.borrow_mut() = remaining;
-    }
-
     #[cfg(feature = "dev-context-only-utils")]
     pub fn set_alpenglow_migration_succeeded_for_tests(&mut self, succeeded: bool) {
         self.environment_config.alpenglow_migration_succeeded = succeeded;
@@ -693,11 +780,6 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         self.environment_config.alpenglow_migration_succeeded
     }
 
-    /// Get cached sysvars
-    pub fn get_sysvar_cache(&self) -> &SysvarCache {
-        self.environment_config.sysvar_cache
-    }
-
     /// Get cached epoch total stake.
     pub fn get_epoch_stake(&self) -> u64 {
         self.environment_config
@@ -729,34 +811,6 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             })
             .map(|owner_key| owner_key != bpf_loader_deprecated::id())
             .unwrap_or(true)
-    }
-
-    // Set this instruction syscall context
-    pub fn set_syscall_context(
-        &mut self,
-        syscall_context: SyscallContext,
-    ) -> Result<(), InstructionError> {
-        *self
-            .syscall_context
-            .last_mut()
-            .ok_or(InstructionError::CallDepth)? = Some(syscall_context);
-        Ok(())
-    }
-
-    // Get this instruction's SyscallContext
-    pub fn get_syscall_context(&self) -> Result<&SyscallContext, InstructionError> {
-        self.syscall_context
-            .last()
-            .and_then(std::option::Option::as_ref)
-            .ok_or(InstructionError::CallDepth)
-    }
-
-    // Get this instruction's SyscallContext
-    pub fn get_syscall_context_mut(&mut self) -> Result<&mut SyscallContext, InstructionError> {
-        self.syscall_context
-            .last_mut()
-            .and_then(|syscall_context| syscall_context.as_mut())
-            .ok_or(InstructionError::CallDepth)
     }
 
     /// Insert a VM register trace
@@ -1024,7 +1078,8 @@ pub fn mock_process_instruction_with_feature_set<
     );
     program_cache_for_tx_batch.set_slot_for_tests(
         invoke_context
-            .get_sysvar_cache()
+            .environment_config
+            .sysvar_cache()
             .get_clock()
             .map(|clock| clock.slot)
             .unwrap_or(1),
@@ -1204,6 +1259,7 @@ mod tests {
                         desired_result,
                     } => {
                         invoke_context
+                            .compute_meter
                             .consume_checked(compute_units_to_consume)
                             .map_err(|_| InstructionError::ComputationalBudgetExceeded)?;
                         return desired_result;

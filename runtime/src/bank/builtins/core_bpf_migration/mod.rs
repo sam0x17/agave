@@ -537,11 +537,8 @@ pub(crate) mod tests {
         solana_message::Message,
         solana_native_token::LAMPORTS_PER_SOL,
         solana_program_runtime::{
-            loaded_programs::{ProgramCacheEntry, ProgramCacheEntryType},
-            solana_sbpf::{
-                self, memory_region::MemoryMapping, program::BuiltinFunctionDefinition,
-                vm::ContextObject,
-            },
+            program_cache_entry::{ProgramCacheEntry, ProgramCacheEntryType},
+            solana_sbpf::{self, program::BuiltinFunctionDefinition, vm::ContextObject},
         },
         solana_pubkey::Pubkey,
         solana_sdk_ids::{bpf_loader, bpf_loader_upgradeable, native_loader, system_program},
@@ -561,12 +558,19 @@ pub(crate) mod tests {
             _: u64,
             _: u64,
             _: u64,
-            _: &mut MemoryMapping,
         ) -> Result<u64, Box<dyn std::error::Error>> {
             Ok(0)
         }
 
-        fn vm(_: *mut solana_sbpf::vm::EbpfVm<C>, _: u64, _: u64, _: u64, _: u64, _: u64) {}
+        fn vm(
+            _: solana_sbpf::vm::EncryptedHostAddressToEbpfVm<C>,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+        ) {
+        }
         fn codegen(_: &mut solana_sbpf::program::JitCompiler<C>) {}
     }
 

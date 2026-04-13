@@ -7,7 +7,7 @@ use {
         create_custom_loader, deploy_program_with_upgrade_authority, load_program, program_address,
         program_data_size, register_builtins,
     },
-    solana_account::{AccountSharedData, PROGRAM_OWNERS, ReadableAccount, WritableAccount},
+    solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_clock::Slot,
     solana_compute_budget::compute_budget_limits::ComputeBudgetLimits,
     solana_compute_budget_interface::ComputeBudgetInstruction,
@@ -29,7 +29,9 @@ use {
         loaded_programs::ProgramRuntimeEnvironments,
     },
     solana_pubkey::Pubkey,
-    solana_sdk_ids::{bpf_loader_upgradeable, compute_budget, native_loader},
+    solana_sdk_ids::{
+        bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, compute_budget, native_loader,
+    },
     solana_signer::Signer,
     solana_svm::{
         account_loader::{CheckedTransactionDetails, TransactionCheckResult},
@@ -147,7 +149,7 @@ impl SvmTestEnvironment<'_> {
         // The sysvars must be put in the cache
         mock_bank.configure_sysvars();
         batch_processor.fill_missing_sysvar_cache_entries(&mock_bank);
-        register_builtins(&mock_bank, &batch_processor, test_entry.with_loader_v4);
+        register_builtins(&mock_bank, &batch_processor);
 
         let processing_config = TransactionProcessingConfig {
             recording_config: ExecutionRecordingConfig {
@@ -369,9 +371,6 @@ pub struct SvmTestEntry {
     // features configuration for this test
     pub feature_set: SVMFeatureSet,
 
-    // until LoaderV4 is live on mainnet, we default to omitting it, but can also test it
-    pub with_loader_v4: bool,
-
     // enables drop on failure processing (transactions without Ok status have no state effect)
     pub drop_on_failure: bool,
 
@@ -398,7 +397,6 @@ impl Default for SvmTestEntry {
     fn default() -> Self {
         Self {
             feature_set: SVMFeatureSet::all_enabled(),
-            with_loader_v4: false,
             all_or_nothing: false,
             drop_on_failure: false,
             initial_programs: Vec::new(),
@@ -411,18 +409,11 @@ impl Default for SvmTestEntry {
 }
 
 impl SvmTestEntry {
-    pub fn with_loader_v4() -> Self {
-        Self {
-            with_loader_v4: true,
-            ..Self::default()
-        }
-    }
-
     pub fn set_rent_params(&mut self, rent: Rent) {
         self.rent = rent;
     }
 
-    // add a new a rent-exempt account that exists before the batch
+    // add a new rent-exempt account that exists before the batch
     // inserts it into both account maps, assuming it lives unchanged (except for svm fixing rent epoch)
     // rent-paying accounts must be added by hand because svm will not set rent epoch to u64::MAX
     pub fn add_initial_account(&mut self, pubkey: Pubkey, account: &AccountSharedData) {
@@ -614,7 +605,7 @@ impl Default for TransactionBatchItem {
 
 // asserts for a given transaction in a batch
 // we can automatically check whether it executed, whether it succeeded
-// log items we expect to see (exect match only), and rodata
+// log items we expect to see (exact match only), and rodata
 #[derive(Clone, Debug, Default)]
 pub struct TransactionBatchItemAsserts {
     pub status: ExecutionStatus,
@@ -2578,8 +2569,13 @@ fn svm_integration(test_entries: Vec<SvmTestEntry>) {
 
 #[test]
 fn program_cache_create_account() {
-    for loader_id in PROGRAM_OWNERS {
-        let mut test_entry = SvmTestEntry::with_loader_v4();
+    let supported_loaders = [
+        bpf_loader_upgradeable::id(),
+        bpf_loader::id(),
+        bpf_loader_deprecated::id(),
+    ];
+    for loader_id in &supported_loaders {
+        let mut test_entry = SvmTestEntry::default();
 
         let fee_payer_keypair = Keypair::new();
         let fee_payer = fee_payer_keypair.pubkey();
@@ -2931,8 +2927,8 @@ fn program_cache_stats() {
         )
     };
 
-    let succesful_noop_instruction = Instruction::new_with_bytes(noop_program, &[], vec![]);
-    let succesful_transfer_instruction =
+    let successful_noop_instruction = Instruction::new_with_bytes(noop_program, &[], vec![]);
+    let successful_transfer_instruction =
         system_instruction::transfer(&fee_payer, &Pubkey::new_unique(), LAMPORTS_PER_SOL);
     let failing_transfer_instruction =
         system_instruction::transfer(&fee_payer, &Pubkey::new_unique(), LAMPORTS_PER_SOL * 1000);
@@ -2943,12 +2939,12 @@ fn program_cache_stats() {
     let mut successful_transfers = 0;
 
     test_entry.push_transaction(make_transaction(slice::from_ref(
-        &succesful_noop_instruction,
+        &successful_noop_instruction,
     )));
     noop_tx_usage += 1;
 
     test_entry.push_transaction(make_transaction(slice::from_ref(
-        &succesful_transfer_instruction,
+        &successful_transfer_instruction,
     )));
     system_tx_usage += 1;
     successful_transfers += 1;
@@ -2960,11 +2956,11 @@ fn program_cache_stats() {
     system_tx_usage += 1;
 
     test_entry.push_transaction(make_transaction(&[
-        succesful_noop_instruction.clone(),
-        succesful_noop_instruction.clone(),
-        succesful_transfer_instruction.clone(),
-        succesful_transfer_instruction.clone(),
-        succesful_noop_instruction.clone(),
+        successful_noop_instruction.clone(),
+        successful_noop_instruction.clone(),
+        successful_transfer_instruction.clone(),
+        successful_transfer_instruction.clone(),
+        successful_noop_instruction.clone(),
     ]));
     noop_tx_usage += 1;
     system_tx_usage += 1;
@@ -2973,8 +2969,8 @@ fn program_cache_stats() {
     test_entry.push_transaction_with_status(
         make_transaction(&[
             failing_transfer_instruction,
-            succesful_noop_instruction.clone(),
-            succesful_transfer_instruction.clone(),
+            successful_noop_instruction.clone(),
+            successful_transfer_instruction.clone(),
         ]),
         ExecutionStatus::ExecutedFailed,
     );
@@ -2984,7 +2980,7 @@ fn program_cache_stats() {
     // load failure/fee-only does not touch the program cache
     test_entry.push_transaction_with_status(
         make_transaction(&[
-            succesful_noop_instruction.clone(),
+            successful_noop_instruction.clone(),
             fee_only_noop_instruction,
         ]),
         ExecutionStatus::ProcessedFailed,
@@ -2998,7 +2994,7 @@ fn program_cache_stats() {
 
     // nor does discard
     test_entry.transaction_batch.push(TransactionBatchItem {
-        transaction: make_transaction(slice::from_ref(&succesful_transfer_instruction)),
+        transaction: make_transaction(slice::from_ref(&successful_transfer_instruction)),
         check_result: Err(TransactionError::BlockhashNotFound),
         asserts: ExecutionStatus::Discarded.into(),
     });
@@ -3074,7 +3070,7 @@ fn program_cache_stats() {
     test_entry.drop_expected_account(buffer_address);
 
     test_entry.push_transaction_with_status(
-        make_transaction(slice::from_ref(&succesful_noop_instruction)),
+        make_transaction(slice::from_ref(&successful_noop_instruction)),
         ExecutionStatus::ExecutedFailed,
     );
     noop_tx_usage += 1;
@@ -3109,7 +3105,7 @@ fn program_cache_stats() {
     };
 
     test_entry.push_transaction_with_status(
-        make_transaction(slice::from_ref(&succesful_noop_instruction)),
+        make_transaction(slice::from_ref(&successful_noop_instruction)),
         ExecutionStatus::ExecutedFailed,
     );
     noop_tx_usage += 1;
@@ -3590,10 +3586,11 @@ mod balance_collector {
             u64::MAX,
         );
 
-        let (_, spl_token) =
-            solana_program_binaries::by_id(&spl_token_interface::id(), &Rent::default())
-                .unwrap()
-                .swap_remove(0);
+        let mut program_accounts =
+            solana_program_binaries::by_id(&spl_token_interface::id(), &Rent::default()).unwrap();
+
+        let (_, spl_token) = program_accounts.swap_remove(0);
+        let (program_data_key, program_data) = program_accounts.swap_remove(0);
 
         for _ in 0..100 {
             let mut test_entry = SvmTestEntry::default();
@@ -3601,6 +3598,8 @@ mod balance_collector {
 
             if use_tokens {
                 test_entry.add_initial_account(spl_token_interface::id(), &spl_token);
+                test_entry.add_initial_account(program_data_key, &program_data);
+
                 test_entry.add_initial_account(mint, &mint_state);
                 test_entry.add_initial_account(alice, &token_state);
                 test_entry.add_initial_account(bob, &token_state);

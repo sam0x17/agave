@@ -5,7 +5,7 @@ use {
         integration_tests::{DEFAULT_NODE_STAKE, ValidatorKeys},
         validator_configs::*,
     },
-    agave_feature_set::{FeatureSet, bls_pubkey_management_in_vote_account, vote_state_v4},
+    agave_feature_set::{FeatureSet, bls_pubkey_management_in_vote_account},
     agave_snapshots::{paths::BANK_SNAPSHOTS_DIR, snapshot_config::SnapshotConfig},
     itertools::izip,
     log::*,
@@ -20,6 +20,7 @@ use {
         validator::{Validator, ValidatorConfig, ValidatorStartProgress, ValidatorTpuConfig},
     },
     solana_epoch_schedule::EpochSchedule,
+    solana_fee_structure::FeeStructure,
     solana_genesis_config::GenesisConfig,
     solana_gossip::{
         contact_info::{ContactInfo, Protocol},
@@ -311,6 +312,7 @@ impl LocalCluster {
 
         let feature_set = FeatureSet::all_enabled();
 
+        let stakes_in_genesis_for_funding = stakes_in_genesis.clone();
         let GenesisConfigInfo {
             mut genesis_config,
             mint_keypair,
@@ -323,6 +325,36 @@ impl LocalCluster {
             &feature_set,
             matches!(alpenglow_mode, AlpenglowMode::Enabled), /* is_alpenglow */
         );
+
+        // In-genesis validators only receive the generic validator account funding from the
+        // genesis helpers. Top them up here so they have the same vote-fee budget as validators
+        // added later via `required_validator_funding()`.
+        let mut additional_validator_funding: u64 = 0;
+        for (validator_vote_keypairs, stake) in
+            keys_in_genesis.iter().zip(&stakes_in_genesis_for_funding)
+        {
+            let validator_pubkey = validator_vote_keypairs.node_keypair.pubkey();
+            let required_funding = Self::required_validator_funding(*stake);
+            let validator_account = genesis_config
+                .accounts
+                .get_mut(&validator_pubkey)
+                .expect("validator account must exist in genesis");
+            let funding_delta = required_funding.saturating_sub(validator_account.lamports);
+            validator_account.lamports = validator_account.lamports.saturating_add(funding_delta);
+            additional_validator_funding =
+                additional_validator_funding.saturating_add(funding_delta);
+        }
+        if additional_validator_funding > 0 {
+            let mint_account = genesis_config
+                .accounts
+                .get_mut(&mint_keypair.pubkey())
+                .expect("mint account must exist in genesis");
+            assert!(
+                mint_account.lamports >= additional_validator_funding,
+                "mint requires additional lamports to fund in-genesis validators"
+            );
+            mint_account.lamports -= additional_validator_funding;
+        }
 
         genesis_config.accounts.extend(
             config
@@ -495,7 +527,7 @@ impl LocalCluster {
 
         discover_peers(
             None,
-            &vec![cluster.entry_point_info.gossip().unwrap()],
+            &[cluster.entry_point_info.gossip().unwrap()],
             Some(config.node_stakes.len() + config.num_listeners as usize),
             Duration::from_secs(120),
             None,
@@ -1054,7 +1086,6 @@ impl LocalCluster {
 
     fn is_bls_pubkey_feature_enabled(rpc_client: &RpcClient) -> bool {
         Self::is_feature_active(rpc_client, &bls_pubkey_management_in_vote_account::id())
-            && Self::is_feature_active(rpc_client, &vote_state_v4::id())
     }
 
     fn setup_vote_and_stake_accounts(
@@ -1255,7 +1286,10 @@ impl LocalCluster {
     }
 
     fn required_validator_funding(stake: u64) -> u64 {
-        stake.saturating_mul(2).saturating_add(2)
+        stake
+            .saturating_mul(2)
+            .saturating_add(2) // 1 lamport for each new account
+            .saturating_add(10_000 * 2 * FeeStructure::default().lamports_per_signature) // vote txs are paid by the node identity and carry two signatures
     }
 }
 

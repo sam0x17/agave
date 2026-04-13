@@ -40,7 +40,8 @@ use {
     solana_account_info::MAX_PERMITTED_DATA_INCREASE,
     solana_accounts_db::{
         accounts::AccountAddressFilter,
-        accounts_index::{AccountIndex, AccountSecondaryIndexes, IndexKey, ScanError},
+        accounts_index::{AccountIndex, AccountSecondaryIndexes, IndexKey},
+        accounts_scan::ScanError,
         ancestors::Ancestors,
     },
     solana_client_traits::SyncClient,
@@ -69,7 +70,6 @@ use {
         get_program_data_address, instruction::UpgradeableLoaderInstruction,
         state::UpgradeableLoaderState,
     },
-    solana_loader_v4_interface::{instruction as loader_v4, state::LoaderV4State},
     solana_message::{
         Message, MessageHeader, SanitizedMessage, compiled_instruction::CompiledInstruction,
     },
@@ -80,7 +80,7 @@ use {
     solana_program_runtime::{
         declare_process_instruction,
         execution_budget::{self, MAX_COMPUTE_UNIT_LIMIT},
-        loaded_programs::{ProgramCacheEntry, ProgramCacheEntryType},
+        program_cache_entry::{ProgramCacheEntry, ProgramCacheEntryType},
         solana_sbpf::program::BuiltinFunctionDefinition,
     },
     solana_pubkey::Pubkey,
@@ -101,7 +101,7 @@ use {
         account_loader::{FeesOnlyTransaction, LoadedTransaction, TRANSACTION_ACCOUNT_BASE_SIZE},
         rollback_accounts::RollbackAccounts,
         transaction_commit_result::TransactionCommitResultExtensions,
-        transaction_execution_result::ExecutedTransaction,
+        transaction_execution_result::{AccountsDeltas, ExecutedTransaction},
     },
     solana_svm_timings::ExecuteTimings,
     solana_svm_transaction::svm_message::SVMMessage,
@@ -122,7 +122,7 @@ use {
         vote_state::{
             self, BlockTimestamp, MAX_LOCKOUT_HISTORY, VoteAuthorize, VoteInit, VoteStateV4,
             VoteStateVersions, VoterWithBLSArgs, create_bls_pubkey_and_proof_of_possession,
-            create_v4_account_with_authorized,
+            create_v4_account_with_authorized, handler::VoteStateHandler,
         },
     },
     spl_generic_token::token,
@@ -236,6 +236,10 @@ fn new_executed_processing_result(
     status: Result<()>,
     fee_details: FeeDetails,
 ) -> TransactionProcessingResult {
+    let accounts_deltas = status.as_ref().is_ok().then_some(AccountsDeltas {
+        accounts_resize_delta: 0,
+        accounts_uninitialized_size: 0,
+    });
     Ok(ProcessedTransaction::Executed(Box::new(
         ExecutedTransaction {
             loaded_transaction: LoadedTransaction {
@@ -248,7 +252,7 @@ fn new_executed_processing_result(
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas,
             },
             programs_modified_by_tx: HashMap::new(),
         },
@@ -773,20 +777,13 @@ where
     bank0.store_account_and_update_capitalization(&stake_id, &stake_account);
 
     // generate some rewards
-    let mut vote_state = Some(VoteStateV4::deserialize(vote_account.data(), &vote_id).unwrap());
+    let mut vote_state =
+        VoteStateHandler::new_v4(VoteStateV4::deserialize(vote_account.data(), &vote_id).unwrap());
     for i in 0..MAX_LOCKOUT_HISTORY + 42 {
-        if let Some(v) = vote_state.as_mut() {
-            vote_state::process_slot_vote_unchecked(v, i as u64)
-        }
-        let versioned = VoteStateVersions::V4(Box::new(vote_state.take().unwrap()));
+        vote_state::process_slot_vote_unchecked(&mut vote_state, i as u64);
+        let versioned = VoteStateVersions::V4(Box::new(vote_state.as_ref_v4().clone()));
         vote_account.set_state(&versioned).unwrap();
         bank0.store_account_and_update_capitalization(&vote_id, &vote_account);
-        match versioned {
-            VoteStateVersions::V4(v) => {
-                vote_state = Some(*v);
-            }
-            _ => panic!("Has to be of type V4"),
-        };
     }
     bank0.store_account_and_update_capitalization(&vote_id, &vote_account);
     bank0.freeze();
@@ -944,20 +941,13 @@ fn do_test_bank_update_rewards_determinism() -> u64 {
     bank.store_account_and_update_capitalization(&stake_id2, &stake_account2);
 
     // generate some rewards
-    let mut vote_state = Some(VoteStateV4::deserialize(vote_account.data(), &vote_id).unwrap());
+    let mut vote_state =
+        VoteStateHandler::new_v4(VoteStateV4::deserialize(vote_account.data(), &vote_id).unwrap());
     for i in 0..MAX_LOCKOUT_HISTORY + 42 {
-        if let Some(v) = vote_state.as_mut() {
-            vote_state::process_slot_vote_unchecked(v, i as u64)
-        }
-        let versioned = VoteStateVersions::V4(Box::new(vote_state.take().unwrap()));
+        vote_state::process_slot_vote_unchecked(&mut vote_state, i as u64);
+        let versioned = VoteStateVersions::V4(Box::new(vote_state.as_ref_v4().clone()));
         vote_account.set_state(&versioned).unwrap();
         bank.store_account_and_update_capitalization(&vote_id, &vote_account);
-        match versioned {
-            VoteStateVersions::V4(v) => {
-                vote_state = Some(*v);
-            }
-            _ => panic!("Has to be of type V4"),
-        };
     }
     bank.store_account_and_update_capitalization(&vote_id, &vote_account);
 
@@ -1209,9 +1199,14 @@ fn test_one_tx_two_out_atomic_pass() {
 // This test demonstrates that fees are paid even when a program fails.
 #[test]
 fn test_detect_failed_duplicate_transactions() {
-    let (mut genesis_config, mint_keypair) = create_genesis_config(LAMPORTS_PER_SOL);
-    genesis_config.fee_rate_governor = FeeRateGovernor::new(5_000, 0);
-    let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    let (genesis_config, mint_keypair) = create_genesis_config(LAMPORTS_PER_SOL);
+    let fee_structure = FeeStructure {
+        lamports_per_signature: 5_000,
+        ..FeeStructure::default()
+    };
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    bank.set_fee_structure(&fee_structure);
+    let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
 
     let dest = Keypair::new();
 
@@ -1239,7 +1234,7 @@ fn test_detect_failed_duplicate_transactions() {
     // This should be the original balance minus the transaction fee.
     assert_eq!(
         bank.get_balance(&mint_keypair.pubkey()),
-        LAMPORTS_PER_SOL - 5_000
+        LAMPORTS_PER_SOL - fee_structure.lamports_per_signature
     );
 }
 
@@ -1437,20 +1432,23 @@ fn test_bank_tx_fee() {
     let mint = arbitrary_transfer_amount * 100;
     let leader = SlotLeader::new_unique();
     let GenesisConfigInfo {
-        mut genesis_config,
+        genesis_config,
         mint_keypair,
         ..
     } = create_genesis_config_with_leader(mint, &leader.id, 3);
-    genesis_config.fee_rate_governor = FeeRateGovernor::new(5000, 0); // something divisible by 2
 
-    let expected_fee_paid = genesis_config
-        .fee_rate_governor
-        .create_fee_calculator()
-        .lamports_per_signature;
-    let (expected_fee_collected, expected_fee_burned) =
-        genesis_config.fee_rate_governor.burn(expected_fee_paid);
+    let fee_structure = FeeStructure {
+        lamports_per_signature: 5000,
+        ..FeeStructure::default()
+    };
+    let expected_fee_paid = fee_structure.lamports_per_signature;
+    let expected_fee_burned =
+        expected_fee_paid * solana_fee_calculator::DEFAULT_BURN_PERCENT as u64 / 100;
+    let expected_fee_collected = expected_fee_paid - expected_fee_burned;
 
-    let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    bank.set_fee_structure(&fee_structure);
+    let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
 
     let capitalization = bank.capitalization();
 
@@ -1553,10 +1551,6 @@ fn test_bank_tx_compute_unit_fee() {
 
     let expected_fee_paid = calculate_test_fee(
         &new_sanitized_message(Message::new(&[], Some(&Pubkey::new_unique()))),
-        genesis_config
-            .fee_rate_governor
-            .create_fee_calculator()
-            .lamports_per_signature,
         bank.fee_structure(),
     );
 
@@ -9174,23 +9168,17 @@ fn test_call_precomiled_program() {
     bank.process_transaction(&tx).unwrap();
 }
 
-fn calculate_test_fee(
-    message: &impl SVMMessage,
-    lamports_per_signature: u64,
-    fee_structure: &FeeStructure,
-) -> u64 {
-    let fee_budget_limits = FeeBudgetLimits::from(
-        process_compute_budget_instructions(
-            message.program_instructions_iter(),
-            &FeatureSet::default(),
-        )
-        .unwrap_or_default(),
-    );
+fn calculate_test_fee(message: &impl SVMMessage, fee_structure: &FeeStructure) -> u64 {
+    let prioritization_fee = process_compute_budget_instructions(
+        message.program_instructions_iter(),
+        &FeatureSet::default(),
+    )
+    .unwrap_or_default()
+    .get_prioritization_fee();
     solana_fee::calculate_fee(
         message,
-        lamports_per_signature == 0,
         fee_structure.lamports_per_signature,
-        fee_budget_limits.prioritization_fee,
+        prioritization_fee,
         FeeFeatures {},
     )
 }
@@ -9202,7 +9190,6 @@ fn test_calculate_fee() {
     assert_eq!(
         calculate_test_fee(
             &message,
-            0,
             &FeeStructure {
                 lamports_per_signature: 0,
                 ..FeeStructure::default()
@@ -9215,7 +9202,6 @@ fn test_calculate_fee() {
     assert_eq!(
         calculate_test_fee(
             &message,
-            1,
             &FeeStructure {
                 lamports_per_signature: 1,
                 ..FeeStructure::default()
@@ -9233,7 +9219,6 @@ fn test_calculate_fee() {
     assert_eq!(
         calculate_test_fee(
             &message,
-            2,
             &FeeStructure {
                 lamports_per_signature: 2,
                 ..FeeStructure::default()
@@ -9256,7 +9241,7 @@ fn test_calculate_fee_compute_units() {
 
     let message = new_sanitized_message(Message::new(&[], Some(&Pubkey::new_unique())));
     assert_eq!(
-        calculate_test_fee(&message, 1, &fee_structure,),
+        calculate_test_fee(&message, &fee_structure,),
         max_fee + lamports_per_signature
     );
 
@@ -9266,7 +9251,7 @@ fn test_calculate_fee_compute_units() {
     let ix1 = system_instruction::transfer(&Pubkey::new_unique(), &Pubkey::new_unique(), 1);
     let message = new_sanitized_message(Message::new(&[ix0, ix1], Some(&Pubkey::new_unique())));
     assert_eq!(
-        calculate_test_fee(&message, 1, &fee_structure,),
+        calculate_test_fee(&message, &fee_structure,),
         max_fee + 3 * lamports_per_signature
     );
 
@@ -9294,16 +9279,14 @@ fn test_calculate_fee_compute_units() {
             ],
             Some(&Pubkey::new_unique()),
         ));
-        let fee = calculate_test_fee(&message, 1, &fee_structure);
-        let fee_budget_limits = FeeBudgetLimits::from(ComputeBudgetLimits {
+        let fee = calculate_test_fee(&message, &fee_structure);
+        let prioritization_fee = ComputeBudgetLimits {
             compute_unit_price: PRIORITIZATION_FEE_RATE,
             compute_unit_limit: requested_compute_units,
             ..ComputeBudgetLimits::default()
-        });
-        assert_eq!(
-            fee,
-            lamports_per_signature + fee_budget_limits.prioritization_fee
-        );
+        }
+        .get_prioritization_fee();
+        assert_eq!(fee, lamports_per_signature + prioritization_fee);
     }
 }
 
@@ -9316,11 +9299,12 @@ fn test_calculate_prioritization_fee() {
 
     let request_units = 1_000_000_u32;
     let request_unit_price = 2_000_000_000_u64;
-    let fee_budget_limits = FeeBudgetLimits::from(ComputeBudgetLimits {
+    let prioritization_fee = ComputeBudgetLimits {
         compute_unit_price: request_unit_price,
         compute_unit_limit: request_units,
         ..ComputeBudgetLimits::default()
-    });
+    }
+    .get_prioritization_fee();
 
     let message = new_sanitized_message(Message::new(
         &[
@@ -9330,14 +9314,10 @@ fn test_calculate_prioritization_fee() {
         Some(&Pubkey::new_unique()),
     ));
 
-    let fee = calculate_test_fee(
-        &message,
-        fee_structure.lamports_per_signature,
-        &fee_structure,
-    );
+    let fee = calculate_test_fee(&message, &fee_structure);
     assert_eq!(
         fee,
-        fee_structure.lamports_per_signature + fee_budget_limits.prioritization_fee
+        fee_structure.lamports_per_signature + prioritization_fee
     );
 }
 
@@ -9370,7 +9350,7 @@ fn test_calculate_fee_secp256k1() {
         ],
         Some(&key0),
     ));
-    assert_eq!(calculate_test_fee(&message, 1, &fee_structure,), 2);
+    assert_eq!(calculate_test_fee(&message, &fee_structure,), 2);
 
     secp_instruction1.data = vec![0];
     secp_instruction2.data = vec![10];
@@ -9378,7 +9358,7 @@ fn test_calculate_fee_secp256k1() {
         &[ix0, secp_instruction1, secp_instruction2],
         Some(&key0),
     ));
-    assert_eq!(calculate_test_fee(&message, 1, &fee_structure,), 11);
+    assert_eq!(calculate_test_fee(&message, &fee_structure,), 11);
 }
 
 #[test]
@@ -9539,6 +9519,116 @@ fn create_mock_transfer(
         &[payer, from, to],
         recent_blockhash,
     )
+}
+
+#[test]
+fn test_accounts_data_size_delta_on_chain_with_deleted_account_transaction() {
+    #[derive(Clone, Copy)]
+    enum PreExecState {
+        RentExempt,
+        RentPaying,
+        Uninitialized,
+    }
+
+    let account_data_size = 100;
+
+    for pre_exec_state in [
+        PreExecState::RentExempt,
+        PreExecState::RentPaying,
+        PreExecState::Uninitialized,
+    ] {
+        let (mut genesis_config, mint_keypair) = create_genesis_config(100 * LAMPORTS_PER_SOL);
+        genesis_config.rent = Rent::default();
+        let mock_program_id = Pubkey::new_unique();
+        let rent_exempt_minimum = genesis_config.rent.minimum_balance(account_data_size);
+        let deleted_account = Keypair::new();
+
+        // Cases 1 and 2 begin with an existing account. Case 3 creates and
+        // drains the account within the same transaction.
+        let balance = match pre_exec_state {
+            PreExecState::RentExempt => {
+                let balance = rent_exempt_minimum + 1;
+                genesis_config.accounts.insert(
+                    deleted_account.pubkey(),
+                    Account::new(balance, account_data_size, &mock_program_id),
+                );
+                balance
+            }
+            PreExecState::RentPaying => {
+                let balance = rent_exempt_minimum - 1;
+                genesis_config.accounts.insert(
+                    deleted_account.pubkey(),
+                    Account::new_rent_epoch(
+                        balance,
+                        account_data_size,
+                        &mock_program_id,
+                        INITIAL_RENT_EPOCH + 1,
+                    ),
+                );
+                balance
+            }
+            PreExecState::Uninitialized => 0,
+        };
+
+        let (bank, _bank_forks) = Bank::new_with_mockup_builtin_for_tests(
+            &genesis_config,
+            mock_program_id,
+            MockTransferBuiltin::register,
+        );
+        let recent_blockhash = bank.last_blockhash();
+
+        let accounts_data_size_delta_on_chain_before =
+            bank.load_accounts_data_size_delta_on_chain();
+        let tx = match pre_exec_state {
+            // Existing rent-exempt/rent-paying account is fully drained and deleted.
+            PreExecState::RentExempt | PreExecState::RentPaying => create_mock_transfer(
+                &mint_keypair,
+                &deleted_account,
+                &mint_keypair,
+                balance,
+                mock_program_id,
+                recent_blockhash,
+            ),
+            // The account starts uninitialized, is created, then immediately drained.
+            PreExecState::Uninitialized => {
+                let create_instruction = system_instruction::create_account(
+                    &mint_keypair.pubkey(),
+                    &deleted_account.pubkey(),
+                    rent_exempt_minimum,
+                    account_data_size as u64,
+                    &mock_program_id,
+                );
+                let transfer_from_instruction = Instruction::new_with_bincode(
+                    mock_program_id,
+                    &MockTransferInstruction::Transfer(rent_exempt_minimum),
+                    vec![
+                        AccountMeta::new(mint_keypair.pubkey(), true),
+                        AccountMeta::new(deleted_account.pubkey(), true),
+                        AccountMeta::new(mint_keypair.pubkey(), false),
+                    ],
+                );
+                Transaction::new_signed_with_payer(
+                    &[create_instruction, transfer_from_instruction],
+                    Some(&mint_keypair.pubkey()),
+                    &[&mint_keypair, &deleted_account],
+                    recent_blockhash,
+                )
+            }
+        };
+        bank.process_transaction(&tx).unwrap();
+        let accounts_data_size_delta_on_chain_after = bank.load_accounts_data_size_delta_on_chain();
+
+        assert!(bank.get_account(&deleted_account.pubkey()).is_none());
+        assert_eq!(
+            accounts_data_size_delta_on_chain_after - accounts_data_size_delta_on_chain_before,
+            match pre_exec_state {
+                PreExecState::RentExempt | PreExecState::RentPaying => {
+                    -(account_data_size as i64)
+                }
+                PreExecState::Uninitialized => 0,
+            },
+        );
+    }
 }
 
 #[test]
@@ -10529,45 +10619,9 @@ fn test_cap_accounts_data_allocations_per_transaction() {
 }
 
 #[test]
-fn test_calculate_fee_with_congestion_multiplier() {
-    let lamports_scale: u64 = 5;
-    let base_lamports_per_signature: u64 = 5_000;
-    let cheap_lamports_per_signature: u64 = base_lamports_per_signature / lamports_scale;
-    let expensive_lamports_per_signature: u64 = base_lamports_per_signature * lamports_scale;
-    let signature_count: u64 = 2;
-    let signature_fee: u64 = 10;
-    let fee_structure = FeeStructure {
-        lamports_per_signature: signature_fee,
-        ..FeeStructure::default()
-    };
-
-    // Two signatures, double the fee.
-    let key0 = Pubkey::new_unique();
-    let key1 = Pubkey::new_unique();
-    let ix0 = system_instruction::transfer(&key0, &key1, 1);
-    let ix1 = system_instruction::transfer(&key1, &key0, 1);
-    let message = new_sanitized_message(Message::new(&[ix0, ix1], Some(&key0)));
-
-    // assert when lamports_per_signature is less than BASE_LAMPORTS, turnning on/off
-    // congestion_multiplier has no effect on fee.
-    assert_eq!(
-        calculate_test_fee(&message, cheap_lamports_per_signature, &fee_structure),
-        signature_fee * signature_count
-    );
-
-    // assert when lamports_per_signature is more than BASE_LAMPORTS, turnning on/off
-    // congestion_multiplier will change calculated fee.
-    assert_eq!(
-        calculate_test_fee(&message, expensive_lamports_per_signature, &fee_structure,),
-        signature_fee * signature_count
-    );
-}
-
-#[test]
 fn test_calculate_fee_with_request_heap_frame_flag() {
     let key0 = Pubkey::new_unique();
     let key1 = Pubkey::new_unique();
-    let lamports_per_signature: u64 = 5_000;
     let signature_fee: u64 = 10;
     let request_cu: u64 = 1;
     let lamports_per_cu: u64 = 5;
@@ -10588,7 +10642,7 @@ fn test_calculate_fee_with_request_heap_frame_flag() {
     // assert when request_heap_frame is presented in tx, prioritization fee will be counted
     // into transaction fee
     assert_eq!(
-        calculate_test_fee(&message, lamports_per_signature, &fee_structure),
+        calculate_test_fee(&message, &fee_structure),
         signature_fee + request_cu * lamports_per_cu
     );
 }
@@ -11272,7 +11326,10 @@ fn test_failed_simulation_compute_units() {
         (bank.get_account(&program_id).unwrap().data().len() + TRANSACTION_ACCOUNT_BASE_SIZE * 2)
             as u32;
     declare_process_instruction!(MockBuiltin, MOCK_BUILTIN_UNITS, |invoke_context| {
-        invoke_context.consume_checked(TEST_UNITS).unwrap();
+        invoke_context
+            .compute_meter
+            .consume_checked(TEST_UNITS)
+            .unwrap();
         Err(InstructionError::InvalidInstructionData)
     });
 
@@ -11394,11 +11451,7 @@ fn test_deploy_last_epoch_slot() {
     agave_logger::setup();
 
     // Bank Setup
-    let (mut genesis_config, mint_keypair) = create_genesis_config(1_000_000 * LAMPORTS_PER_SOL);
-    activate_feature(
-        &mut genesis_config,
-        agave_feature_set::enable_loader_v4::id(),
-    );
+    let (genesis_config, mint_keypair) = create_genesis_config(1_000_000 * LAMPORTS_PER_SOL);
     let bank = Bank::new_for_tests(&genesis_config);
 
     // go to the last slot in the epoch
@@ -11415,44 +11468,51 @@ fn test_deploy_last_epoch_slot() {
     // deploy a program
     let payer_keypair = Keypair::new();
     let program_keypair = Keypair::new();
+    let buffer_address = Pubkey::new_unique();
+    let upgrade_authority_keypair = Keypair::new();
     let mut file = File::open("../programs/bpf_loader/test_elfs/out/noop_aligned.so").unwrap();
     let mut elf = Vec::new();
     file.read_to_end(&mut elf).unwrap();
-    let min_program_balance = bank.get_minimum_balance_for_rent_exemption(
-        LoaderV4State::program_data_offset().saturating_add(elf.len()),
-    );
-    let upgrade_authority_keypair = Keypair::new();
 
-    let mut program_account = AccountSharedData::new(
-        min_program_balance,
-        LoaderV4State::program_data_offset().saturating_add(elf.len()),
-        &solana_sdk_ids::loader_v4::id(),
+    let program_len = elf.len();
+    let min_program_balance =
+        bank.get_minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_program());
+    let min_buffer_balance = bank.get_minimum_balance_for_rent_exemption(
+        UpgradeableLoaderState::size_of_buffer(program_len),
     );
-    let program_state = <&mut [u8; LoaderV4State::program_data_offset()]>::try_from(
-        program_account
+    let min_programdata_balance = bank.get_minimum_balance_for_rent_exemption(
+        UpgradeableLoaderState::size_of_programdata(program_len),
+    );
+
+    // Setup buffer account with ELF.
+    let buffer_account = {
+        let mut account = AccountSharedData::new(
+            min_buffer_balance,
+            UpgradeableLoaderState::size_of_buffer(program_len),
+            &bpf_loader_upgradeable::id(),
+        );
+        account
+            .set_state(&UpgradeableLoaderState::Buffer {
+                authority_address: Some(upgrade_authority_keypair.pubkey()),
+            })
+            .unwrap();
+        account
             .data_as_mut_slice()
-            .get_mut(0..LoaderV4State::program_data_offset())
-            .unwrap(),
-    )
-    .unwrap();
-    let program_state = unsafe {
-        std::mem::transmute::<&mut [u8; LoaderV4State::program_data_offset()], &mut LoaderV4State>(
-            program_state,
-        )
+            .get_mut(UpgradeableLoaderState::size_of_buffer_metadata()..)
+            .unwrap()
+            .copy_from_slice(&elf);
+        account
     };
-    program_state.authority_address_or_next_version = upgrade_authority_keypair.pubkey();
-    program_account
-        .data_as_mut_slice()
-        .get_mut(LoaderV4State::program_data_offset()..)
-        .unwrap()
-        .copy_from_slice(&elf);
 
     let payer_base_balance = LAMPORTS_PER_SOL;
     let deploy_fees = {
         let fee_calculator = genesis_config.fee_rate_governor.create_fee_calculator();
         3 * fee_calculator.lamports_per_signature
     };
-    let min_payer_balance = min_program_balance.saturating_add(deploy_fees);
+    let min_payer_balance = min_program_balance
+        .saturating_add(min_programdata_balance)
+        .saturating_sub(min_buffer_balance)
+        .saturating_add(deploy_fees);
     bank.store_account(
         &payer_keypair.pubkey(),
         &AccountSharedData::new(
@@ -11461,15 +11521,22 @@ fn test_deploy_last_epoch_slot() {
             &system_program::id(),
         ),
     );
-    bank.store_account(&program_keypair.pubkey(), &program_account);
+    bank.store_account(&buffer_address, &buffer_account);
+
+    #[allow(deprecated)]
     let message = Message::new(
-        &[loader_v4::deploy(
+        &solana_loader_v3_interface::instruction::deploy_with_max_program_len(
+            &payer_keypair.pubkey(),
             &program_keypair.pubkey(),
+            &buffer_address,
             &upgrade_authority_keypair.pubkey(),
-        )],
+            min_program_balance,
+            program_len,
+        )
+        .unwrap(),
         Some(&payer_keypair.pubkey()),
     );
-    let signers = &[&payer_keypair, &upgrade_authority_keypair];
+    let signers = &[&payer_keypair, &program_keypair, &upgrade_authority_keypair];
     let transaction = Transaction::new(signers, message, bank.last_blockhash());
     let ret = bank.process_transaction(&transaction);
     assert!(ret.is_ok(), "ret: {ret:?}");

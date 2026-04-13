@@ -68,7 +68,7 @@ bincode = { workspace = true }
 bytemuck = { workspace = true }
 crossbeam-channel = { workspace = true }
 dashmap = { workspace = true, features = ["rayon", "raw-api", "serde"] }
-im = { workspace = true, features = ["rayon", "serde"] }
+imbl = { workspace = true, features = ["rayon", "serde"] }
 itertools = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
@@ -128,7 +128,6 @@ solana-lattice-hash = { workspace = true }
 solana-leader-schedule = { workspace = true }
 solana-leader-schedule-program = { workspace = true }
 solana-loader-v3-interface = { workspace = true, features = ["bincode"] }
-solana-loader-v4-interface = { workspace = true, features = ["bincode"] }
 solana-measure = { workspace = true }
 solana-message = { workspace = true }
 solana-metrics = { workspace = true }
