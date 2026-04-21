@@ -1788,12 +1788,12 @@ impl Bank {
             );
         }
 
-        // Update on-chain leader schedule accounts.
+        // Update on-chain epoch stakes accounts.
         if self
             .feature_set
-            .is_active(&feature_set::on_chain_leader_schedule::id())
+            .is_active(&feature_set::on_chain_epoch_stakes::id())
         {
-            crate::on_chain_leader_schedule::update_on_chain_leader_schedule(self);
+            crate::on_chain_epoch_stakes::update_on_chain_epoch_stakes(self);
         }
 
         report_new_epoch_metrics(

@@ -117,10 +117,10 @@ pub static BUILTINS: &[BuiltinPrototype] = &[
     }),
     testable_prototype!(BuiltinPrototype {
         core_bpf_migration_config: None,
-        name: leader_schedule_program,
-        enable_feature_id: Some(feature_set::on_chain_leader_schedule::id()),
-        program_id: solana_leader_schedule_program::id(),
-        register_fn: solana_leader_schedule_program::Entrypoint::register,
+        name: epoch_stakes_program,
+        enable_feature_id: Some(feature_set::on_chain_epoch_stakes::id()),
+        program_id: solana_epoch_stakes_program::id(),
+        register_fn: solana_epoch_stakes_program::Entrypoint::register,
     }),
 ];
 
@@ -346,7 +346,7 @@ pub mod test_only {
         };
     }
 
-    pub mod leader_schedule_program {
+    pub mod epoch_stakes_program {
         pub mod feature {
             solana_pubkey::declare_id!("9FpRbfbzMYoR2xnFE4VBbJVkHpXdoyJRSmFhkFGbJTC3");
         }
@@ -362,7 +362,7 @@ pub mod test_only {
             feature_id: feature::id(),
             migration_target: super::CoreBpfMigrationTargetType::Builtin,
             verified_build_hash: None,
-            datapoint_name: "migrate_builtin_to_core_bpf_leader_schedule_program",
+            datapoint_name: "migrate_builtin_to_core_bpf_epoch_stakes_program",
         };
     }
 }
@@ -412,7 +412,7 @@ mod tests {
         );
         assert_eq!(
             &super::BUILTINS[9].core_bpf_migration_config,
-            &Some(super::test_only::leader_schedule_program::CONFIG)
+            &Some(super::test_only::epoch_stakes_program::CONFIG)
         );
     }
 }

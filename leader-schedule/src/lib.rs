@@ -12,7 +12,6 @@ use {
 };
 
 pub mod epoch_stakes_on_chain;
-pub mod on_chain;
 mod vote_keyed;
 /// Stake-weighted leader schedule for one epoch.
 pub use vote_keyed::LeaderSchedule;

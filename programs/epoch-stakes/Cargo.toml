@@ -1,7 +1,7 @@
 [package]
-name = "solana-leader-schedule-program"
-description = "Solana Leader Schedule program"
-documentation = "https://docs.rs/solana-leader-schedule-program"
+name = "solana-epoch-stakes-program"
+description = "Solana Epoch Stakes program"
+documentation = "https://docs.rs/solana-epoch-stakes-program"
 version = { workspace = true }
 authors = { workspace = true }
 repository = { workspace = true }
@@ -14,7 +14,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 
 [lib]
 crate-type = ["lib"]
-name = "solana_leader_schedule_program"
+name = "solana_epoch_stakes_program"
 
 [features]
 agave-unstable-api = []

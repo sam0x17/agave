@@ -1501,7 +1501,7 @@ pub mod direct_account_pointers_in_program_input {
     solana_pubkey::declare_id!("ptrXWLkSDMZZmZN8GAT6W5yW4EvYByfw6cRRHbXwQNS");
 }
 
-pub mod on_chain_leader_schedule {
+pub mod on_chain_epoch_stakes {
     solana_pubkey::declare_id!("AzY6X6WxuXLC4khfYUWrp4JNCiuhvv8atwHtYXW4Guwy");
 }
 
@@ -2554,8 +2554,8 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
             "SIMD-0490: Upgrade BPF Stake Program to v5.0.0",
         ),
         (
-            on_chain_leader_schedule::id(),
-            "on-chain leader schedule accounts",
+            on_chain_epoch_stakes::id(),
+            "SIMD-0511: On-chain epoch stakes accounts",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/

@@ -135,11 +135,11 @@ impl ReservedAccount {
     }
 }
 
-// Leader schedule program ID. Per-epoch account PDAs cannot be statically
+// Epoch stakes program ID. Per-epoch account PDAs cannot be statically
 // enumerated, so they are not individually listed in the reserved key set.
 // Read-only integrity is enforced by the owning native program, which rejects
 // all instructions (see SIMD-0511).
-mod leader_schedule_ids {
+mod epoch_stakes_ids {
     use solana_pubkey::Pubkey;
 
     pub const PROGRAM_ID: Pubkey =
@@ -189,12 +189,12 @@ static RESERVED_ACCOUNTS: std::sync::LazyLock<Vec<ReservedAccount>> =
             // other
             ReservedAccount::new_active(native_loader::id()),
             ReservedAccount::new_active(sysvar::id()),
-            // leader schedule program (per-epoch account PDAs are not
-            // individually reserved — integrity is enforced by the owning
+            // epoch stakes program (per-epoch account PDAs are not
+            // individually reserved; integrity is enforced by the owning
             // native program; see SIMD-0511)
             ReservedAccount::new_pending(
-                leader_schedule_ids::PROGRAM_ID,
-                agave_feature_set::on_chain_leader_schedule::id(),
+                epoch_stakes_ids::PROGRAM_ID,
+                agave_feature_set::on_chain_epoch_stakes::id(),
             ),
         ]
     });
