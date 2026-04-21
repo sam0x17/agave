@@ -6580,8 +6580,8 @@ dependencies = [
  "agave-feature-set",
  "solana-bpf-loader-program",
  "solana-compute-budget-program",
+ "solana-epoch-stakes-program",
  "solana-hash 4.3.0",
- "solana-leader-schedule-program",
  "solana-loader-v4-program",
  "solana-program-runtime",
  "solana-pubkey 4.2.0",
@@ -7178,6 +7178,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-epoch-stakes-program"
+version = "4.1.0-alpha.0"
+dependencies = [
+ "solana-program-runtime",
+ "solana-pubkey 4.2.0",
+]
+
+[[package]]
 name = "solana-faucet"
 version = "4.1.0-alpha.0"
 dependencies = [
@@ -7595,16 +7603,9 @@ dependencies = [
  "itertools 0.14.0",
  "rand_chacha 0.9.0",
  "solana-clock",
+ "solana-hash 4.3.0",
  "solana-pubkey 4.2.0",
  "solana-vote",
-]
-
-[[package]]
-name = "solana-leader-schedule-program"
-version = "4.1.0-alpha.0"
-dependencies = [
- "solana-program-runtime",
- "solana-pubkey 4.1.0",
 ]
 
 [[package]]
@@ -8621,6 +8622,7 @@ dependencies = [
  "solana-epoch-info",
  "solana-epoch-rewards-hasher",
  "solana-epoch-schedule",
+ "solana-epoch-stakes-program",
  "solana-feature-gate-interface",
  "solana-fee",
  "solana-fee-calculator",
@@ -8633,7 +8635,6 @@ dependencies = [
  "solana-keypair",
  "solana-lattice-hash",
  "solana-leader-schedule",
- "solana-leader-schedule-program",
  "solana-loader-v3-interface",
  "solana-measure",
  "solana-message",

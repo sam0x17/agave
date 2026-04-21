@@ -7,11 +7,8 @@
 //! full design.
 
 use {
-    crate::bank::Bank,
-    solana_account::AccountSharedData,
-    solana_clock::Epoch,
-    solana_leader_schedule::epoch_stakes_on_chain as stakes_format,
-    solana_pubkey::Pubkey,
+    crate::bank::Bank, solana_account::AccountSharedData, solana_clock::Epoch,
+    solana_leader_schedule::epoch_stakes_on_chain as stakes_format, solana_pubkey::Pubkey,
 };
 
 /// PDA seed prefix for epoch stakes accounts.
@@ -178,10 +175,7 @@ mod tests {
 
         assert_eq!(header.num_entries as usize, bank_vote_accounts.len());
 
-        let on_chain_total: u64 = bank_vote_accounts
-            .values()
-            .map(|(stake, _)| *stake)
-            .sum();
+        let on_chain_total: u64 = bank_vote_accounts.values().map(|(stake, _)| *stake).sum();
         assert_eq!(header.total_stake, on_chain_total);
     }
 }
