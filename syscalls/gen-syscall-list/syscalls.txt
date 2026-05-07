@@ -25,6 +25,7 @@ sol_invoke_signed_c
 sol_invoke_signed_rust
 sol_log_data
 sol_blake3
+sol_sha512
 sol_curve_validate_point
 sol_curve_group_op
 sol_curve_multiscalar_mul

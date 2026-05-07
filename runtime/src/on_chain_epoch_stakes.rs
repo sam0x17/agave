@@ -7,8 +7,11 @@
 //! full design.
 
 use {
-    crate::bank::Bank, solana_account::AccountSharedData, solana_clock::Epoch,
-    solana_leader_schedule::epoch_stakes_on_chain as stakes_format, solana_pubkey::Pubkey,
+    crate::bank::Bank,
+    solana_account::AccountSharedData,
+    solana_clock::Epoch,
+    solana_leader_schedule::epoch_stakes_on_chain::{self as stakes_format, EpochStakesEntry},
+    solana_pubkey::Pubkey,
 };
 
 /// PDA seed prefix for epoch stakes accounts.
@@ -46,12 +49,30 @@ fn write_epoch_stakes_account(bank: &Bank, epoch: Epoch) {
         return;
     };
 
-    let stakes: Vec<_> = vote_accounts
+    let entries: Vec<EpochStakesEntry> = vote_accounts
         .iter()
-        .map(|(pubkey, (stake, _))| (*pubkey, *stake))
+        .map(|(vote_pubkey, (stake, vote_account))| {
+            let view = vote_account.vote_state_view();
+            let node_pubkey = *vote_account.node_pubkey();
+            // SIMD-0232 commission collector: use the on-chain inflation
+            // rewards collector if set, otherwise fall back to node_pubkey
+            // per the SIMD-0511 schema rules.
+            let commission_collector = view
+                .inflation_rewards_collector()
+                .copied()
+                .unwrap_or(node_pubkey);
+            EpochStakesEntry {
+                vote_pubkey: *vote_pubkey,
+                node_pubkey,
+                commission_collector,
+                delegated_stake: *stake,
+                cumulative_credits: view.credits(),
+                commission: view.commission(),
+            }
+        })
         .collect();
 
-    let data = stakes_format::serialize_epoch_stakes(&stakes, epoch);
+    let data = stakes_format::serialize_epoch_stakes(&entries, epoch);
     store_program_account(bank, &addr, &data);
 }
 
@@ -154,7 +175,8 @@ mod tests {
         assert_eq!(data_before, data_after);
     }
 
-    /// Verify the on-chain epoch stakes match what the bank has internally.
+    /// Verify the on-chain epoch stakes match what the bank has internally,
+    /// across every per-vote-account field defined by SIMD-0511.
     #[test]
     fn test_on_chain_matches_bank_epoch_stakes() {
         let leader_pubkey = solana_pubkey::new_rand();
@@ -175,7 +197,26 @@ mod tests {
 
         assert_eq!(header.num_entries as usize, bank_vote_accounts.len());
 
-        let on_chain_total: u64 = bank_vote_accounts.values().map(|(stake, _)| *stake).sum();
-        assert_eq!(header.total_stake, on_chain_total);
+        let bank_total: u64 = bank_vote_accounts.values().map(|(stake, _)| *stake).sum();
+        assert_eq!(header.total_stake, bank_total);
+
+        // Cross-check every per-vote-account field.
+        let on_chain_entries =
+            solana_leader_schedule::epoch_stakes_on_chain::get_all_entries(account.data()).unwrap();
+        for entry in &on_chain_entries {
+            let (bank_stake, bank_vote_account) = bank_vote_accounts
+                .get(&entry.vote_pubkey)
+                .expect("vote_pubkey from on-chain account should exist in bank");
+            assert_eq!(entry.delegated_stake, *bank_stake);
+            assert_eq!(entry.node_pubkey, *bank_vote_account.node_pubkey());
+            let view = bank_vote_account.vote_state_view();
+            assert_eq!(entry.commission, view.commission());
+            assert_eq!(entry.cumulative_credits, view.credits());
+            let expected_collector = view
+                .inflation_rewards_collector()
+                .copied()
+                .unwrap_or(*bank_vote_account.node_pubkey());
+            assert_eq!(entry.commission_collector, expected_collector);
+        }
     }
 }

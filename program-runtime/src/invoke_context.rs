@@ -15,6 +15,7 @@ use {
         loaded_programs::{
             ProgramCacheForTxBatch, ProgramRuntimeEnvironment, ProgramRuntimeEnvironments,
         },
+        memory_context::{MemoryContext, MemoryContexts},
         program_cache_entry::ProgramCacheEntryType,
         stable_log,
         sysvar_cache::SysvarCache,
@@ -215,91 +216,6 @@ impl ComputeMeter {
     }
 }
 
-pub struct MemoryContexts(Vec<MemoryContext>);
-
-impl MemoryContexts {
-    /// Set this instruction's [`MemoryContext`].
-    pub fn set_memory_context(
-        &mut self,
-        memory_context: MemoryContext,
-    ) -> Result<(), InstructionError> {
-        *self.0.last_mut().ok_or(InstructionError::CallDepth)? = memory_context;
-        Ok(())
-    }
-
-    /// Get current instruction's [`MemoryContext`]
-    pub fn memory_context(&self) -> Result<&MemoryContext, InstructionError> {
-        self.0.last().ok_or(InstructionError::CallDepth)
-    }
-
-    /// Get current instruction's [`MemoryContext`] for mutable use.
-    pub fn memory_context_mut(&mut self) -> Result<&mut MemoryContext, InstructionError> {
-        self.0.last_mut().ok_or(InstructionError::CallDepth)
-    }
-
-    pub fn memory_mapping(&self) -> Result<&MemoryMapping, InstructionError> {
-        let last_context = self.memory_context()?;
-        Ok(&last_context.memory_mapping)
-    }
-
-    pub fn memory_mapping_mut(&mut self) -> Result<&mut MemoryMapping, InstructionError> {
-        let last_context = self.memory_context_mut()?;
-        Ok(&mut last_context.memory_mapping)
-    }
-
-    #[cfg(feature = "dev-context-only-utils")]
-    pub fn mock_set_mapping(&mut self, memory_mapping: MemoryMapping) {
-        self.0 = vec![MemoryContext {
-            allocator: BpfAllocator::new(0),
-            accounts_metadata: vec![],
-            memory_mapping: Box::new(memory_mapping),
-        }];
-    }
-}
-
-/// This structure contains metadata about the memory for each instruction under execution.
-/// The BpfAllocator, accounts addresses in the guest and the memory mapping.
-pub struct MemoryContext {
-    pub allocator: BpfAllocator,
-    pub accounts_metadata: Vec<SerializedAccountMetadata>,
-    memory_mapping: Box<MemoryMapping>,
-}
-
-impl MemoryContext {
-    /// Creates a new memory context
-    pub fn new(
-        allocator: BpfAllocator,
-        accounts_metadata: Vec<SerializedAccountMetadata>,
-        memory_mapping: MemoryMapping,
-    ) -> Self {
-        Self {
-            allocator,
-            accounts_metadata,
-            memory_mapping: Box::new(memory_mapping),
-        }
-    }
-
-    /// Returns an empty dummy context used for builtin functions
-    pub(crate) fn empty() -> Self {
-        Self {
-            allocator: BpfAllocator::new(0),
-            accounts_metadata: Vec::new(),
-            memory_mapping: Box::new(
-                MemoryMapping::new(Vec::new(), &Config::default(), SBPFVersion::Reserved).unwrap(),
-            ),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SerializedAccountMetadata {
-    pub original_data_len: usize,
-    pub vm_data_addr: u64,
-    pub vm_key_addr: u64,
-    pub vm_lamports_addr: u64,
-    pub vm_owner_addr: u64,
-}
-
 /// Main pipeline from runtime to program execution.
 pub struct InvokeContext<'a, 'ix_data> {
     /// Information about the currently executing transaction.
@@ -346,7 +262,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             compute_meter: ComputeMeter(Cell::new(compute_budget.compute_unit_limit)),
             total_nested_exec_time: Duration::ZERO,
             timings: ExecuteDetailsTimings::default(),
-            memory_contexts: MemoryContexts(Vec::new()),
+            memory_contexts: MemoryContexts::new(),
             register_traces: Vec::new(),
             #[cfg(feature = "sbpf-debugger")]
             debug_port: None,
@@ -380,13 +296,13 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             }
         }
 
-        self.memory_contexts.0.push(MemoryContext::empty());
+        self.memory_contexts.push_placeholder();
         self.transaction_context.push()
     }
 
     /// Pop a stack frame from the invocation stack
     pub(crate) fn pop(&mut self) -> Result<(), InstructionError> {
-        self.memory_contexts.0.pop();
+        self.memory_contexts.pop();
         self.transaction_context.pop()
     }
 
@@ -691,6 +607,17 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         stable_log::program_invoke(&logger, &program_id, self.get_stack_height());
         let pre_remaining_units = self.get_remaining();
         // For now, only built-ins are invoked from here, so the VM and its Config are irrelevant.
+        self.memory_contexts
+            .set_memory_context_abi_v1(MemoryContext::new(
+                BpfAllocator::new(0),
+                Vec::new(),
+                // SAFETY:
+                // This path invokes a builtin program, so this mapping is never used.
+                unsafe {
+                    MemoryMapping::new(Vec::new(), &Config::default(), SBPFVersion::Reserved)
+                        .unwrap()
+                },
+            ))?;
         let mut vm = EbpfVm::new(
             Arc::clone(
                 &**self

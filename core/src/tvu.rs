@@ -48,7 +48,7 @@ use {
     solana_ledger::{
         blockstore::Blockstore, blockstore_cleanup_service::BlockstoreCleanupService,
         blockstore_processor::TransactionStatusSender, entry_notifier_service::EntryNotifierSender,
-        leader_schedule_cache::LeaderScheduleCache,
+        leader_schedule_cache::LeaderScheduleCache, shred::filter::TurbineMode,
     },
     solana_poh::{poh_controller::PohController, poh_recorder::PohRecorder},
     solana_pubkey::Pubkey,
@@ -59,6 +59,7 @@ use {
     solana_runtime::{
         bank::MAX_ALPENGLOW_VOTE_ACCOUNTS, bank_forks::BankForks, commitment::BlockCommitmentCache,
         prioritization_fee_cache::PrioritizationFeeCache, snapshot_controller::SnapshotController,
+        validated_block_finalization::ValidatedBlockFinalizationCert,
         vote_sender_types::ReplayVoteSender,
     },
     solana_streamer::{
@@ -110,12 +111,6 @@ pub struct Tvu {
     bls_sigverify_threads: Option<(JoinHandle<()>, JoinHandle<()>)>,
     votor: Votor,
     commitment_service: AggregateCommitmentService,
-
-    // TODO: these will be used when the block component processor is upstreamed
-    #[allow(dead_code)]
-    reward_certs_receiver: Receiver<BuildRewardCertsResponse>,
-    #[allow(dead_code)]
-    build_reward_certs_sender: Sender<BuildRewardCertsRequest>,
 }
 
 pub struct TvuSockets {
@@ -164,6 +159,7 @@ pub struct AlpenglowInitializationState {
     pub leader_window_info_sender: Sender<LeaderWindowInfo>,
     pub replay_highest_frozen: Arc<ReplayHighestFrozen>,
     pub highest_parent_ready: Arc<RwLock<(Slot, (Slot, Hash))>>,
+    pub highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
 
     // Main communication channel
     pub votor_event_sender: VotorEventSender,
@@ -177,6 +173,10 @@ pub struct AlpenglowInitializationState {
     // For BLS voting service
     pub bls_connection_cache: Arc<ConnectionCache>,
     pub voting_service_test_override: Option<VotingServiceOverride>,
+
+    // For rewards
+    pub reward_certs_sender: Sender<BuildRewardCertsResponse>,
+    pub build_reward_certs_receiver: Receiver<BuildRewardCertsRequest>,
 }
 
 impl Tvu {
@@ -205,7 +205,7 @@ impl Tvu {
         leader_schedule_cache: &Arc<LeaderScheduleCache>,
         exit: Arc<AtomicBool>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
-        turbine_disabled: Arc<AtomicBool>,
+        turbine_mode: TurbineMode,
         transaction_status_sender: Option<TransactionStatusSender>,
         entry_notification_sender: Option<EntryNotifierSender>,
         vote_tracker: Arc<VoteTracker>,
@@ -252,6 +252,9 @@ impl Tvu {
             key_notifiers,
             bls_connection_cache,
             voting_service_test_override,
+            highest_finalized,
+            build_reward_certs_receiver,
+            reward_certs_sender,
         } = votor_init;
 
         // streamer and sigverify for A2A BLS messages
@@ -343,7 +346,7 @@ impl Tvu {
             bank_forks.clone(),
             cluster_info.clone(),
             outstanding_repair_requests.clone(),
-            turbine_disabled,
+            turbine_mode,
             exit.clone(),
         );
 
@@ -359,6 +362,15 @@ impl Tvu {
             fetch_receiver,
             retransmit_sender.clone(),
             verified_sender,
+            Arc::new({
+                let outstanding_repair_requests = outstanding_repair_requests.clone();
+                move |nonce| {
+                    outstanding_repair_requests
+                        .read()
+                        .unwrap()
+                        .fetch_metadata_for_nonce(nonce)
+                }
+            }),
             tvu_config.shred_sigverify_threads,
         );
 
@@ -418,6 +430,7 @@ impl Tvu {
                 repair_info,
                 window_service_channels,
                 leader_schedule_cache.clone(),
+                tvu_config.shred_version,
                 outstanding_repair_requests,
             )
         };
@@ -444,11 +457,6 @@ impl Tvu {
                 rpc_subscriptions.clone(),
             );
 
-        // TODO: when the block component processor is upstreamed,
-        // it will use the unused channels below.
-        let (reward_certs_sender, reward_certs_receiver) = bounded(MAX_ALPENGLOW_PACKET_NUM);
-        let (build_reward_certs_sender, build_reward_certs_receiver) =
-            bounded(MAX_ALPENGLOW_PACKET_NUM);
         let votor_config = VotorConfig {
             exit: exit.clone(),
             vote_account: *vote_account,
@@ -478,6 +486,7 @@ impl Tvu {
             reward_certs_sender,
             build_reward_certs_receiver,
             generated_cert_types,
+            highest_finalized,
         };
         let votor = Votor::new(votor_config);
 
@@ -607,13 +616,6 @@ impl Tvu {
             bls_sigverify_threads,
             votor,
             commitment_service,
-            // TODO: these two channels are here temporarily and will be removed when the block
-            // component processor is upstreamed from the Alpenglow repo which will consume them.
-            // We need some place to store them temporarily so that they are not dropped.
-            // Dropping them causes interacting with the other ends in the BlsSigverifier to fail
-            // which causes the sigverifier to exit which resulting in various tests to fail.
-            reward_certs_receiver,
-            build_reward_certs_sender,
         })
     }
 
@@ -782,6 +784,8 @@ pub mod tests {
                 thread::sleep(Duration::from_secs(1));
             }
         });
+        let (reward_certs_sender, _reward_certs_receiver) = bounded(1);
+        let (_build_reward_certs_sender, build_reward_certs_receiver) = bounded(1);
 
         let tvu = Tvu::new(
             &vote_keypair.pubkey(),
@@ -813,7 +817,7 @@ pub mod tests {
             &leader_schedule_cache,
             exit.clone(),
             block_commitment_cache,
-            Arc::<AtomicBool>::default(),
+            TurbineMode::default(),
             None, // transaction_status_sender
             None, // entry_notification_sender
             Arc::<VoteTracker>::default(),
@@ -848,6 +852,9 @@ pub mod tests {
                 key_notifiers,
                 bls_connection_cache: Arc::new(bls_connection_cache),
                 voting_service_test_override: None,
+                highest_finalized: Arc::new(RwLock::new(None)),
+                build_reward_certs_receiver,
+                reward_certs_sender,
             },
         )
         .expect("assume success");

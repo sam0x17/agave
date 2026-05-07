@@ -1,3 +1,5 @@
+#[cfg(feature = "dev-context-only-utils")]
+use qualifier_attr::qualifiers;
 use {
     crate::{stake_history::StakeHistory, stakes::SerdeStakesToStakeFormat},
     serde::{
@@ -5,7 +7,7 @@ use {
         de::{SeqAccess, Visitor},
     },
     solana_bls_signatures::pubkey::{
-        PubkeyAffine as BLSPubkeyAffine, PubkeyCompressed as BLSPubkeyCompressed,
+        PopVerified, PubkeyAffine as BLSPubkeyAffine, PubkeyCompressed as BLSPubkeyCompressed,
     },
     solana_clock::Epoch,
     solana_pubkey::Pubkey,
@@ -32,7 +34,7 @@ pub struct BLSPubkeyStakeEntry {
     /// The identity of the validator specified in the vote account
     pub node_pubkey: Pubkey,
     /// The bls pubkey of the validator specified in the vote account
-    pub bls_pubkey: BLSPubkeyAffine,
+    pub bls_pubkey: PopVerified<BLSPubkeyAffine>,
     /// The stake of the validator
     pub stake: u64,
 }
@@ -64,11 +66,14 @@ impl solana_frozen_abi::abi_example::AbiExample for BLSPubkeyToRankMap {
 
 pub(crate) fn bls_pubkey_compressed_bytes_to_bls_pubkey(
     bls_pubkey_compressed_bytes: [u8; BLS_PUBLIC_KEY_COMPRESSED_SIZE],
-) -> Option<(BLSPubkeyCompressed, BLSPubkeyAffine)> {
+) -> Option<(BLSPubkeyCompressed, PopVerified<BLSPubkeyAffine>)> {
     let bls_pubkey_compressed: BLSPubkeyCompressed =
         bincode::deserialize(&bls_pubkey_compressed_bytes).ok()?;
     let bls_pubkey_affine = BLSPubkeyAffine::try_from(bls_pubkey_compressed).ok()?;
-    Some((bls_pubkey_compressed, bls_pubkey_affine))
+    // It is safe to use `new_unchecked` here because data coming from the vote
+    // state has already had its PoP verified.
+    let bls_pubkey_pop_verified = unsafe { PopVerified::new_unchecked(bls_pubkey_affine) };
+    Some((bls_pubkey_compressed, bls_pubkey_pop_verified))
 }
 
 impl BLSPubkeyToRankMap {
@@ -134,7 +139,7 @@ impl BLSPubkeyToRankMap {
         self.rank_map.len()
     }
 
-    pub fn get_rank(&self, bls_pubkey: &BLSPubkeyAffine) -> Option<&u16> {
+    pub fn get_rank(&self, bls_pubkey: &PopVerified<BLSPubkeyAffine>) -> Option<&u16> {
         let bls_pubkey_compressed = BLSPubkeyCompressed(bls_pubkey.to_bytes_compressed());
         self.rank_map.get(&bls_pubkey_compressed)
     }
@@ -160,6 +165,7 @@ pub struct NodeVoteAccounts {
 /// Its bincode serializaiton format is identical as `VersionedEpochStakes`, but allows faster
 /// deserialization by ignoring serialized stake delegations entirely.
 #[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 pub(crate) enum DeserializableVersionedEpochStakes {
     Current {
         stakes: DeserializableEpochStakes,
@@ -203,6 +209,7 @@ impl From<DeserializableVersionedEpochStakes> for VersionedEpochStakes {
 }
 
 impl VersionedEpochStakes {
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     pub(crate) fn new(stakes: SerdeStakesToStakeFormat, leader_schedule_epoch: Epoch) -> Self {
         let stakes = EpochStakes::from(stakes);
         let epoch_vote_accounts = stakes.vote_accounts();
@@ -403,6 +410,7 @@ impl From<SerdeStakesToStakeFormat> for EpochStakes {
 ///
 /// Needed because snapshots contain additional fields no longer present in EpochStakes.
 #[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 pub(crate) struct DeserializableEpochStakes {
     vote_accounts: VoteAccounts,
     #[serde(deserialize_with = "deserialize_and_ignore_stake_delegations")]
@@ -493,7 +501,7 @@ pub(crate) mod tests {
                     iter::repeat_with(|| {
                         let authorized_voter = solana_pubkey::new_rand();
                         let bls_pubkey_compressed: BLSPubkeyCompressed =
-                            BLSKeypair::new().public.into();
+                            (*BLSKeypair::new().public).into();
                         let bls_pubkey_compressed_serialized =
                             bincode::serialize(&bls_pubkey_compressed)
                                 .unwrap()
@@ -556,8 +564,8 @@ pub(crate) mod tests {
             new_vote_accounts(num_nodes, num_vote_accounts_per_node, is_alpenglow);
 
         let expected_authorized_voters: HashMap<_, _> = vote_accounts_map
-            .iter()
-            .flat_map(|(_, vote_accounts)| {
+            .values()
+            .flat_map(|vote_accounts| {
                 vote_accounts
                     .iter()
                     .map(|v| (v.vote_account, v.authorized_voter))

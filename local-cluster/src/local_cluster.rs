@@ -28,7 +28,7 @@ use {
         node::Node,
     },
     solana_keypair::Keypair,
-    solana_ledger::{create_new_tmp_ledger_with_size, shred::Shred},
+    solana_ledger::{create_new_tmp_ledger, shred::Shred},
     solana_message::Message,
     solana_native_token::LAMPORTS_PER_SOL,
     solana_net_utils::{SocketAddrSpace, sockets::bind_to_localhost_unique},
@@ -371,10 +371,7 @@ impl LocalCluster {
         genesis_config.poh_config = config.poh_config.clone();
 
         let mut leader_config = safe_clone_config(&config.validator_configs[0]);
-        let (leader_ledger_path, _blockhash) = create_new_tmp_ledger_with_size!(
-            &genesis_config,
-            leader_config.max_genesis_archive_unpacked_size,
-        );
+        let (leader_ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
 
         leader_config.rpc_addrs = Some((
             leader_node.info.rpc().unwrap(),
@@ -457,7 +454,6 @@ impl LocalCluster {
                 Arc::new(RwLock::new(vec![leader_vote_keypair.clone()])),
                 vec![],
                 &leader_config,
-                true, // should_check_duplicate_instance
                 None, // rpc_to_plugin_manager_receiver
                 Arc::new(RwLock::new(ValidatorStartProgress::default())),
                 socket_addr_space,
@@ -623,10 +619,7 @@ impl LocalCluster {
         let validator_pubkey = validator_keypair.pubkey();
         let validator_node = Node::new_localhost_with_pubkey(&validator_pubkey);
         let contact_info = validator_node.info.clone();
-        let (ledger_path, _blockhash) = create_new_tmp_ledger_with_size!(
-            &self.genesis_config,
-            validator_config.max_genesis_archive_unpacked_size,
-        );
+        let (ledger_path, _blockhash) = create_new_tmp_ledger!(&self.genesis_config);
 
         // Give the validator some lamports to setup vote accounts
         if is_listener {
@@ -668,7 +661,6 @@ impl LocalCluster {
             Arc::new(RwLock::new(vec![voting_keypair.clone()])),
             vec![self.entry_point_info.clone()],
             &config,
-            true, // should_check_duplicate_instance
             None, // rpc_to_plugin_manager_receiver
             Arc::new(RwLock::new(ValidatorStartProgress::default())),
             socket_addr_space,
@@ -734,7 +726,6 @@ impl LocalCluster {
                 Arc::new(RwLock::new(vec![leader_vote_keypair.clone()])),
                 vec![],
                 &leader_config,
-                true, // should_check_duplicate_instance
                 None, // rpc_to_plugin_manager_receiver
                 Arc::new(RwLock::new(ValidatorStartProgress::default())),
                 socket_addr_space,
@@ -778,10 +769,7 @@ impl LocalCluster {
 
                 let validator_node = Node::new_localhost_with_pubkey(&validator_keypair.pubkey());
                 let contact_info = validator_node.info.clone();
-                let (ledger_path, _blockhash) = create_new_tmp_ledger_with_size!(
-                    &genesis_config,
-                    validator_config.max_genesis_archive_unpacked_size,
-                );
+                let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
 
                 let mut config = validator_config;
                 config.rpc_addrs = Some((
@@ -798,7 +786,6 @@ impl LocalCluster {
                     Arc::new(RwLock::new(vec![voting_keypair.clone()])),
                     entry_points,
                     &config,
-                    true, // should_check_duplicate_instance
                     None, // rpc_to_plugin_manager_receiver
                     Arc::new(RwLock::new(ValidatorStartProgress::default())),
                     socket_addr_space,
@@ -1429,7 +1416,6 @@ impl Cluster for LocalCluster {
             Arc::new(RwLock::new(vec![validator_info.voting_keypair.clone()])),
             entry_point_infos,
             &safe_clone_config(&cluster_validator_info.config),
-            true, // should_check_duplicate_instance
             None, // rpc_to_plugin_manager_receiver
             Arc::new(RwLock::new(ValidatorStartProgress::default())),
             socket_addr_space,

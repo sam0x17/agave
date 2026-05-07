@@ -15,6 +15,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 [features]
 agave-unstable-api = []
 dev-context-only-utils = [
+    "solana-entry/dev-context-only-utils",
     "solana-ledger/dev-context-only-utils",
     "solana-perf/dev-context-only-utils",
     "solana-runtime/dev-context-only-utils",
@@ -71,7 +72,6 @@ log = { workspace = true }
 min-max-heap = { workspace = true }
 num_cpus = { workspace = true }
 num_enum = { workspace = true }
-prio-graph = { workspace = true }
 qualifier_attr = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
@@ -183,7 +183,7 @@ bitvec = { workspace = true }
 criterion = { workspace = true }
 serial_test = { workspace = true }
 solana-account = { workspace = true, features = ["dev-context-only-utils"] }
-solana-bpf-loader-program = { path = "../programs/bpf_loader", default-features = false, features = ["agave-unstable-api"] }
+solana-bpf-loader-program = { path = "../programs/bpf_loader", default-features = false, features = ["agave-unstable-api", "svm-internal"] }
 solana-client = { path = "../client", features = ["dev-context-only-utils"] }
 solana-compute-budget = { workspace = true }
 solana-compute-budget-interface = { workspace = true }
@@ -214,12 +214,6 @@ test-case = { workspace = true }
 jemallocator = { workspace = true }
 
 [[bench]]
-name = "banking_stage"
-
-[[bench]]
-name = "gen_keys"
-
-[[bench]]
 name = "sigverify_stage"
 harness = false
 
@@ -229,14 +223,6 @@ harness = false
 
 [[bench]]
 name = "shredder"
-harness = false
-
-[[bench]]
-name = "receive_and_buffer"
-harness = false
-
-[[bench]]
-name = "scheduler"
 harness = false
 
 [lints]

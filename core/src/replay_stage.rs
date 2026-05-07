@@ -901,6 +901,7 @@ impl ReplayStage {
                     &my_pubkey,
                     &vote_account,
                     &mut replay_timing,
+                    &own_vote_sender,
                 );
                 let did_complete_bank = !new_frozen_slots.is_empty();
                 if migration_status.is_alpenglow_enabled() {
@@ -2063,6 +2064,7 @@ impl ReplayStage {
                 slot_descendants
                     .iter()
                     .chain(std::iter::once(&slot_to_purge)),
+                true,
             )
         };
 
@@ -2547,6 +2549,7 @@ impl ReplayStage {
         bank: &BankWithScheduler,
         replay_stats: &RwLock<ReplaySlotStats>,
         replay_progress: &RwLock<ConfirmationProgress>,
+        finalization_cert_sender: &Sender<Vec<ConsensusMessage>>,
     ) -> result::Result<usize, BlockstoreProcessorError> {
         let mut w_replay_stats = replay_stats.write().unwrap();
         let mut w_replay_progress = replay_progress.write().unwrap();
@@ -2568,6 +2571,7 @@ impl ReplayStage {
                 .entry_notification_sender
                 .as_ref(),
             Some(&process_active_banks_context.replay_vote_sender),
+            Some(finalization_cert_sender),
             false,
             process_active_banks_context.log_messages_bytes_limit,
             process_active_banks_context
@@ -3306,6 +3310,7 @@ impl ReplayStage {
         process_active_banks_context: &ProcessActiveBanksContext,
         bank_replay_result_tracker: BankReplayResultTracker,
         my_pubkey: &Pubkey,
+        finalization_cert_sender: &Sender<Vec<ConsensusMessage>>,
     ) -> (ReplaySlotFromBlockstore, Option<u64>) {
         let BankReplayResultTracker {
             mut replay_result,
@@ -3353,6 +3358,7 @@ impl ReplayStage {
             &bank,
             &replay_stats,
             &replay_progress,
+            finalization_cert_sender,
         );
         replay_blockstore_time.stop();
         replay_result.replay_result = Some(blockstore_result);
@@ -3365,6 +3371,7 @@ impl ReplayStage {
         bank_replay_result_trackers: Vec<BankReplayResultTracker>,
         replay_timing: &mut ReplayLoopTiming,
         my_pubkey: &Pubkey,
+        finalization_cert_sender: &Sender<Vec<ConsensusMessage>>,
     ) -> Vec<ReplaySlotFromBlockstore> {
         match &process_active_banks_context.replay_mode {
             // Skip the overhead of the threadpool if there is only one bank to play
@@ -3386,6 +3393,7 @@ impl ReplayStage {
                                         process_active_banks_context,
                                         bank_replay_result_tracker,
                                         my_pubkey,
+                                        finalization_cert_sender,
                                     );
                                 if let Some(replay_blockstore_us) = replay_blockstore_us {
                                     longest_replay_time_us
@@ -3413,6 +3421,7 @@ impl ReplayStage {
                         process_active_banks_context,
                         bank_replay_result_tracker,
                         my_pubkey,
+                        finalization_cert_sender,
                     );
                     if let Some(replay_blockstore_us) = replay_blockstore_us {
                         replay_timing.replay_blockstore_us += replay_blockstore_us;
@@ -3849,6 +3858,7 @@ impl ReplayStage {
         my_pubkey: &Pubkey,
         vote_account: &Pubkey,
         replay_timing: &mut ReplayLoopTiming,
+        finalization_cert_sender: &Sender<Vec<ConsensusMessage>>,
     ) -> Vec<Slot> /* completed slots */ {
         let bank_replay_result_trackers = Self::prepare_active_banks_for_replay(
             process_active_banks_context,
@@ -3867,6 +3877,7 @@ impl ReplayStage {
             bank_replay_result_trackers,
             replay_timing,
             my_pubkey,
+            finalization_cert_sender,
         );
 
         // Process replay results.
@@ -4594,15 +4605,25 @@ impl ReplayStage {
         // Find the next slot that chains to the old slot
         let mut generate_new_bank_forks_read_lock =
             Measure::start("generate_new_bank_forks_read_lock");
-        let forks = bank_forks.read().unwrap();
-        generate_new_bank_forks_read_lock.stop();
+        let (frozen_banks, frozen_bank_slots, root, known_bank_slots) = {
+            let forks = bank_forks.read().unwrap();
+            generate_new_bank_forks_read_lock.stop();
 
-        let frozen_banks: HashMap<_, _> = forks.frozen_banks().collect();
-        let frozen_bank_slots: Vec<_> = frozen_banks
-            .keys()
-            .cloned()
-            .filter(|slot| *slot >= forks.root() && !progress.get(slot).unwrap().is_dead)
-            .collect();
+            let frozen_banks: HashMap<_, _> = forks.frozen_banks().collect();
+            let frozen_bank_slots: Vec<_> = frozen_banks
+                .keys()
+                .cloned()
+                .filter(|slot| *slot >= forks.root() && !progress.get(slot).unwrap().is_dead)
+                .collect();
+            let known_bank_slots = forks.banks().keys().copied().collect::<HashSet<_>>();
+
+            (
+                frozen_banks,
+                frozen_bank_slots,
+                forks.root(),
+                known_bank_slots,
+            )
+        };
 
         let mut generate_new_bank_forks_get_slots_since =
             Measure::start("generate_new_bank_forks_get_slots_since");
@@ -4624,19 +4645,14 @@ impl ReplayStage {
                 .get(&parent_slot)
                 .expect("missing parent in bank forks");
             for child_slot in children {
-                if forks.get(child_slot).is_some() || new_banks.contains_key(&child_slot) {
+                if known_bank_slots.contains(&child_slot) || new_banks.contains_key(&child_slot) {
                     trace!("child already active or frozen {child_slot}");
                     continue;
                 }
                 let leader = leader_schedule_cache
                     .slot_leader_at(child_slot, Some(parent_bank))
                     .unwrap();
-                info!(
-                    "new fork:{} parent:{} root:{}",
-                    child_slot,
-                    parent_slot,
-                    forks.root()
-                );
+                info!("new fork:{child_slot} parent:{parent_slot} root:{root}",);
                 // Migration period banks are VoM
                 let options = NewBankOptions {
                     vote_only_bank: migration_status.should_bank_be_vote_only(child_slot),
@@ -4647,7 +4663,7 @@ impl ReplayStage {
                 let child_bank = Self::new_bank_from_parent_with_notify(
                     parent_bank.clone(),
                     child_slot,
-                    forks.root(),
+                    root,
                     leader,
                     rpc_subscriptions,
                     slot_status_notifier,
@@ -4660,12 +4676,11 @@ impl ReplayStage {
                     empty,
                     vec![leader.id],
                     parent_bank.slot(),
-                    &forks,
+                    &bank_forks.read().unwrap(),
                 );
                 new_banks.insert(child_slot, child_bank);
             }
         }
-        drop(forks);
         generate_new_bank_forks_loop.stop();
 
         let mut generate_new_bank_forks_write_lock =
@@ -4675,6 +4690,9 @@ impl ReplayStage {
             let root = forks.root();
             for (slot, bank) in new_banks {
                 if slot < root {
+                    continue;
+                }
+                if forks.get(slot).is_some() {
                     continue;
                 }
                 if forks.get(bank.parent_slot()).is_none() {
@@ -5567,6 +5585,7 @@ pub(crate) mod tests {
 
         let slot = bank.slot();
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let (finalization_cert_sender, _finalization_cert_receiver) = unbounded();
         let process_active_banks_context = ProcessActiveBanksContext::new_for_tests(
             bank_forks.clone(),
             blockstore.clone(),
@@ -5625,6 +5644,7 @@ pub(crate) mod tests {
                     &bank,
                     &bank_progress.replay_stats,
                     &bank_progress.replay_progress,
+                    &finalization_cert_sender,
                 )),
             }
         };
@@ -5708,6 +5728,7 @@ pub(crate) mod tests {
             let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
             let exit = Arc::new(AtomicBool::new(false));
             let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+            let (finalization_cert_sender, _finalization_cert_receiver) = unbounded();
             let process_active_banks_context = ProcessActiveBanksContext::new_for_tests(
                 bank_forks.clone(),
                 blockstore.clone(),
@@ -5718,6 +5739,7 @@ pub(crate) mod tests {
                 &bank1,
                 &bank1_progress.replay_stats,
                 &bank1_progress.replay_progress,
+                &finalization_cert_sender,
             )
             .and_then(|replay_tx_count| {
                 let mut poh_verify_elapsed = 0;

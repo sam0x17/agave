@@ -26,11 +26,12 @@ use {
     solana_runtime::{
         bank::Bank, bank_forks::SharableBanks,
         leader_schedule_utils::last_of_consecutive_leader_slots,
+        validated_block_finalization::ValidatedBlockFinalizationCert,
     },
     stats::ConsensusPoolServiceStats,
     std::{
         sync::{
-            Arc,
+            Arc, RwLock,
             atomic::{AtomicBool, Ordering},
         },
         thread::{self, Builder, JoinHandle},
@@ -59,6 +60,9 @@ pub(crate) struct ConsensusPoolContext {
     pub(crate) bls_sender: Sender<BLSOp>,
     pub(crate) event_sender: VotorEventSender,
     pub(crate) commitment_sender: Sender<CommitmentAggregationData>,
+
+    /// Used to communicate the highest finalization cert the pool has observed to the block creation loop.
+    pub(crate) highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
 }
 
 pub(crate) struct ConsensusPoolService {
@@ -87,12 +91,15 @@ impl ConsensusPoolService {
         new_certificates_to_send: Vec<Arc<Certificate>>,
         standstill_timer: &mut Instant,
         stats: &mut ConsensusPoolServiceStats,
+        highest_finalized: &RwLock<Option<ValidatedBlockFinalizationCert>>,
     ) -> Result<(), AddVoteError> {
         // If we have a new finalized slot, update the root and send new certificates
         if new_finalized_slot.is_some() {
             // Reset standstill timer
             *standstill_timer = Instant::now();
             stats.new_finalized_slot += 1;
+
+            *highest_finalized.write().unwrap() = consensus_pool.get_highest_finalization_certs();
         }
         let bank = sharable_banks.root();
         consensus_pool.maybe_prune(bank.slot());
@@ -164,6 +171,7 @@ impl ConsensusPoolService {
             new_certificates_to_send,
             standstill_timer,
             stats,
+            &ctx.highest_finalized,
         )
     }
 
@@ -250,7 +258,7 @@ impl ConsensusPoolService {
                 // Genesis cert though.
                 if kick_off_parent_ready {
                     events.push(VotorEvent::Standstill(
-                        consensus_pool.highest_finalized_slot(),
+                        consensus_pool.highest_finalized_slot().unwrap_or(0),
                     ));
                 }
                 stats.standstill = true;
@@ -377,8 +385,10 @@ impl ConsensusPoolService {
             .slot_leader_at(*highest_parent_ready, Some(&root_bank))
         else {
             error!(
-                "Unable to compute the leader at slot {highest_parent_ready}. Something is wrong, \
-                 exiting"
+                "my_pubkey={}: unable to compute leader: \
+                 highest_parent_ready={highest_parent_ready} root_bank_slot={}.  Exiting",
+                ctx.cluster_info.id(),
+                root_bank.slot()
             );
             ctx.exit.store(true, Ordering::Relaxed);
             return;
@@ -423,8 +433,7 @@ impl ConsensusPoolService {
                     start_slot,
                     end_slot,
                     parent_block,
-                    // TODO: we can just remove this
-                    skip_timer: Instant::now(),
+                    block_timer: Instant::now(),
                 }));
                 stats.parent_ready_produce_window += 1;
             }
@@ -446,7 +455,8 @@ mod tests {
             vote::Vote,
         },
         solana_bls_signatures::{
-            keypair::Keypair as BLSKeypair, signature::Signature as BLSSignature,
+            BLS_SIGNATURE_AFFINE_SIZE, keypair::Keypair as BLSKeypair,
+            signature::Signature as BLSSignature,
         },
         solana_gossip::cluster_info::ClusterInfo,
         solana_hash::Hash,
@@ -475,6 +485,7 @@ mod tests {
         blockstore: Arc<Blockstore>,
         exit: Arc<AtomicBool>,
         cluster_info: Arc<ClusterInfo>,
+        highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
     }
 
     impl Default for TestContext {
@@ -530,6 +541,7 @@ mod tests {
                 blockstore,
                 exit: Arc::new(AtomicBool::new(false)),
                 cluster_info,
+                highest_finalized: Arc::new(RwLock::new(None)),
             }
         }
     }
@@ -591,6 +603,7 @@ mod tests {
                     new_certificates_to_send,
                     &mut standstill_timer,
                     &mut stats,
+                    &ctx.highest_finalized,
                 )
                 .unwrap();
             }
@@ -642,7 +655,7 @@ mod tests {
         let target_slot = 3;
         let skip_certificate = Certificate {
             cert_type: CertificateType::Skip(target_slot),
-            signature: BLSSignature::default(),
+            signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
             bitmap: vec![],
         };
         events.clear();
@@ -670,6 +683,7 @@ mod tests {
             new_certificates_to_send,
             &mut standstill_timer,
             &mut stats,
+            &ctx.highest_finalized,
         )
         .unwrap();
 
@@ -703,7 +717,7 @@ mod tests {
         for slot in 1..next_leader_slot.0 {
             let skip_certificate = Certificate {
                 cert_type: CertificateType::Skip(slot),
-                signature: BLSSignature::default(),
+                signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
                 bitmap: vec![],
             };
 
@@ -734,6 +748,7 @@ mod tests {
             bls_sender: ctx.bls_sender.clone(),
             event_sender: crossbeam_channel::unbounded().0,
             commitment_sender: ctx.commitment_sender.clone(),
+            highest_finalized: ctx.highest_finalized.clone(),
         };
         let mut stats = ConsensusPoolServiceStats::new();
 
@@ -772,12 +787,12 @@ mod tests {
         let certificates = vec![
             Arc::new(Certificate {
                 cert_type: CertificateType::Skip(1),
-                signature: BLSSignature::default(),
+                signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
                 bitmap: vec![],
             }),
             Arc::new(Certificate {
                 cert_type: CertificateType::Skip(2),
-                signature: BLSSignature::default(),
+                signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
                 bitmap: vec![],
             }),
         ];
@@ -812,7 +827,7 @@ mod tests {
 
         let certificates = vec![Arc::new(Certificate {
             cert_type: CertificateType::Skip(1),
-            signature: BLSSignature::default(),
+            signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
             bitmap: vec![],
         })];
 
@@ -829,7 +844,7 @@ mod tests {
 
         let certificates = vec![Arc::new(Certificate {
             cert_type: CertificateType::Skip(1),
-            signature: BLSSignature::default(),
+            signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
             bitmap: vec![],
         })];
 
@@ -845,6 +860,7 @@ mod tests {
             certificates,
             &mut standstill_timer,
             &mut stats,
+            &ctx.highest_finalized,
         );
 
         assert!(result.is_ok());
