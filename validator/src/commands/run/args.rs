@@ -368,7 +368,10 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .takes_value(true)
             .default_value(&default_args.dynamic_port_range)
             .validator(port_range_validator)
-            .help("Range to use for dynamically assigned ports"),
+            .help(
+                "Range to use for dynamically assigned ports. MIN_PORT-MAX_PORT yields the range \
+                 [MIN_PORT, MAX_PORT)",
+            ),
     )
     .arg(
         Arg::with_name("maximum_local_snapshot_age")
@@ -545,6 +548,12 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("require-tower")
             .takes_value(false)
             .help("Refuse to start if saved tower state is not found"),
+    )
+    .arg(
+        clap::Arg::with_name("do_not_require_vote_history")
+            .long("do-not-require-vote-history")
+            .takes_value(false)
+            .help("Do not require saved vote history state for startup"),
     )
     .arg(
         Arg::with_name("expected_genesis_hash")
@@ -949,14 +958,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .hidden(hidden_unless_forced()),
     )
     .arg(
-        Arg::with_name("accounts_db_access_storages_method")
-            .long("accounts-db-access-storages-method")
-            .value_name("METHOD")
-            .takes_value(true)
-            .possible_values(&["mmap", "file"])
-            .help("Access account storages using this method"),
-    )
-    .arg(
         Arg::with_name("accounts_db_ancient_append_vecs")
             .long("accounts-db-ancient-append-vecs")
             .value_name("SLOT-OFFSET")
@@ -1312,6 +1313,8 @@ mod tests {
                     notification_threads: None,
                     queue_capacity_items:
                         solana_rpc::rpc_pubsub_service::DEFAULT_QUEUE_CAPACITY_ITEMS,
+                    queue_capacity_bytes:
+                        solana_rpc::rpc_pubsub_service::DEFAULT_QUEUE_CAPACITY_BYTES,
                     ..PubSubConfig::default_for_tests()
                 },
                 send_transaction_service_config: SendTransactionServiceConfig::default(),

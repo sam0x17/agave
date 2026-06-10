@@ -22,7 +22,6 @@ pub struct FeatureSnapshot {
     pub disable_fees_sysvar: bool,
     pub curve25519_syscall_enabled: bool,
     pub stake_raise_minimum_delegation_to_1_sol: bool,
-    pub stake_minimum_delegation_for_rewards: bool,
     pub disable_deploy_of_alloc_free_syscall: bool,
     pub increase_tx_account_lock_limit: bool,
     pub enable_bpf_loader_set_authority_checked_ix: bool,
@@ -75,7 +74,6 @@ pub struct FeatureSnapshot {
     pub set_lamports_per_byte_to_5080: bool,
     pub set_lamports_per_byte_to_2575: bool,
     pub set_lamports_per_byte_to_1322: bool,
-    pub remove_simple_vote_from_cost_model: bool,
     pub limit_instruction_accounts: bool,
     pub block_revenue_sharing: bool,
     pub vote_account_initialize_v2: bool,
@@ -87,6 +85,10 @@ pub struct FeatureSnapshot {
     pub enable_sha512_syscall: bool,
     pub relax_post_exec_min_balance_check: bool,
     pub enable_tx_v1: bool,
+    pub define_ltds_fee_only_semantics: bool,
+    pub validate_chained_block_id_2: bool,
+    pub upgrade_bpf_stake_program_to_v5_1: bool,
+    pub on_chain_epoch_stakes: bool,
 }
 
 impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
@@ -98,9 +100,6 @@ impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
             curve25519_syscall_enabled: is_active(&curve25519_syscall_enabled::ID),
             stake_raise_minimum_delegation_to_1_sol: is_active(
                 &stake_raise_minimum_delegation_to_1_sol::ID,
-            ),
-            stake_minimum_delegation_for_rewards: is_active(
-                &stake_minimum_delegation_for_rewards::ID,
             ),
             disable_deploy_of_alloc_free_syscall: is_active(
                 &disable_deploy_of_alloc_free_syscall::ID,
@@ -186,7 +185,6 @@ impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
             set_lamports_per_byte_to_5080: is_active(&set_lamports_per_byte_to_5080::ID),
             set_lamports_per_byte_to_2575: is_active(&set_lamports_per_byte_to_2575::ID),
             set_lamports_per_byte_to_1322: is_active(&set_lamports_per_byte_to_1322::ID),
-            remove_simple_vote_from_cost_model: is_active(&remove_simple_vote_from_cost_model::ID),
             limit_instruction_accounts: is_active(&limit_instruction_accounts::ID),
             block_revenue_sharing: is_active(&block_revenue_sharing::ID),
             vote_account_initialize_v2: is_active(&vote_account_initialize_v2::ID),
@@ -202,6 +200,10 @@ impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
             enable_sha512_syscall: is_active(&enable_sha512_syscall::ID),
             relax_post_exec_min_balance_check: is_active(&relax_post_exec_min_balance_check::ID),
             enable_tx_v1: is_active(&enable_tx_v1::ID),
+            define_ltds_fee_only_semantics: is_active(&define_ltds_fee_only_semantics::ID),
+            validate_chained_block_id_2: is_active(&validate_chained_block_id_2::ID),
+            upgrade_bpf_stake_program_to_v5_1: is_active(&upgrade_bpf_stake_program_to_v5_1::ID),
+            on_chain_epoch_stakes: is_active(&on_chain_epoch_stakes::ID),
         }
     }
 }
@@ -367,6 +369,7 @@ impl FeatureSet {
             loader_v3_minimum_extend_program_size: snapshot.loader_v3_minimum_extend_program_size,
             enable_sha512_syscall: snapshot.enable_sha512_syscall,
             relax_post_exec_min_balance_check: snapshot.relax_post_exec_min_balance_check,
+            define_ltds_fee_only_semantics: snapshot.define_ltds_fee_only_semantics,
         }
     }
 }
@@ -735,10 +738,6 @@ pub mod require_static_program_ids_in_transaction {
 pub mod stake_raise_minimum_delegation_to_1_sol {
     // This is a feature-proposal *feature id*.  The feature keypair address is `GQXzC7YiSNkje6FFUk6sc2p53XRvKoaZ9VMktYzUMnpL`.
     solana_pubkey::declare_id!("9onWzzvCzNC2jfhxxeqRgs5q7nFAAKpCUvkj6T6GJK9i");
-}
-
-pub mod stake_minimum_delegation_for_rewards {
-    solana_pubkey::declare_id!("G6ANXD6ptCSyNd9znZm7j4dEczAJCfx7Cy43oBx3rKHJ");
 }
 
 pub mod add_set_compute_unit_price_ix {
@@ -1234,7 +1233,7 @@ pub mod enable_sbpf_v3_deployment_and_execution {
 }
 
 pub mod disable_sbpf_v0_v1_v2_deployment {
-    solana_pubkey::declare_id!("5789pRHRXvzpj5ZmGAjHL2QRCDwFx5CuoUqEB55hunbo");
+    solana_pubkey::declare_id!("B8JJXCy5amZyWG9r7EnUYLwzXSXTxG7GZ1qZ1qggo83g");
 }
 
 pub mod remove_accounts_executable_flag_checks {
@@ -1322,27 +1321,7 @@ pub mod formalize_loaded_transaction_data_size {
 }
 
 pub mod alpenglow {
-    #[cfg(feature = "dev-context-only-utils")]
-    use {
-        solana_keypair::{Keypair, Signer},
-        std::sync::LazyLock,
-    };
-
-    // Used to activate alpenglow in local-cluster tests without exposing the actual feature's private key
-    #[cfg(feature = "dev-context-only-utils")]
-    pub static TEST_KEYPAIR: LazyLock<Keypair> = LazyLock::new(|| {
-        let keypair = Keypair::from_base58_string(
-            "2Vzd6oTWU4RtM5UmsSyBH3tAhPSi1sKqMeMC8bF1jzHHLBMRhEWtrfmBV4EmwQbGSwkunk5Wy67kXNAL1ZL1xQhR",
-        );
-        assert_eq!(keypair.pubkey(), super::alpenglow::id());
-        keypair
-    });
-
-    #[cfg(not(feature = "dev-context-only-utils"))]
     solana_pubkey::declare_id!("mustRekeyVm2QHYB3JPefBiU4BY3Z6JkW2k3Scw5GWP");
-
-    #[cfg(feature = "dev-context-only-utils")]
-    solana_pubkey::declare_id!("8KpruRFrT59jQ9NfFX9DU6j8a1hW7y6xchvZNQ5rxD4P");
 }
 
 pub mod disable_zk_elgamal_proof_program {
@@ -1450,7 +1429,7 @@ pub mod commission_rate_in_basis_points {
 }
 
 pub mod custom_commission_collector {
-    solana_pubkey::declare_id!("CustomCommissionCo11ector111111111111111111");
+    solana_pubkey::declare_id!("3HcSrCTGXTUnrTueHi4DAwNuMxZSsm5xui2Ax3mgxHqf");
 }
 
 pub mod enable_bls12_381_syscall {
@@ -1508,6 +1487,10 @@ pub mod validate_chained_block_id {
     solana_pubkey::declare_id!("vcmrbYbiMVKaq1snKP6eCacNDcr6qZvpCNUjmk6gxvZ");
 }
 
+pub mod validate_chained_block_id_2 {
+    solana_pubkey::declare_id!("vcmrw431aNM8ngQ46derkZXipoTGQdbHkEygBDh12dA");
+}
+
 pub mod validator_admission_ticket {
     solana_pubkey::declare_id!("VAT9huvhPjRN9cyrPytq9rwvEJ3J4ADtjdncgZRyANJ");
 }
@@ -1542,6 +1525,40 @@ pub mod relax_post_exec_min_balance_check {
 
 pub mod enable_tx_v1 {
     solana_pubkey::declare_id!("txv1hPU76QFBVeq3942jJ65e9Em2xbdbCJrzX8sM4U4");
+}
+
+pub mod define_ltds_fee_only_semantics {
+    solana_pubkey::declare_id!("LTDSzjZKFJMKHYpNycG1FrWwGGTaFFwqEFjB5GGLNVD");
+}
+
+pub mod set_lamports_per_byte_to_6960 {
+    solana_pubkey::declare_id!("5AqsUgSb6cgLizSaNiFn3o9XB7VUtKDtDZfcKEjEDmni");
+
+    pub const LAMPORTS_PER_BYTE: u64 = 6960;
+}
+
+pub mod reduce_slot_time_to_350ms {
+    solana_pubkey::declare_id!("iBRL5RuWhw4yqaAZu96RUULHckHTZAoe2b77qaV38JZ");
+}
+
+pub mod reduce_slot_time_to_300ms {
+    solana_pubkey::declare_id!("iBRLL3k18HST852F1Mf3Lv83waTNQmmqvKDxvYGwQFL");
+}
+
+pub mod reduce_slot_time_to_250ms {
+    solana_pubkey::declare_id!("iBRLMc81UjRa8fn8A6eE8bJTnRbgQoPTynM51akENCV");
+}
+
+pub mod reduce_slot_time_to_200ms {
+    solana_pubkey::declare_id!("iBRLjhJnkmDZgNoZRDMW11d8ZV7HvsL3vAyRjZB5npW");
+}
+
+pub mod upgrade_bpf_stake_program_to_v5_1 {
+    solana_pubkey::declare_id!("s51VGwCAgebo2745DSUris72RavoLkXGUmVJosESCXr");
+
+    pub mod buffer {
+        solana_pubkey::declare_id!("p51x11QCYMHwuVS1MBcLHKb3MezWyqGS5BEB41CA1dk");
+    }
 }
 
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
@@ -1857,10 +1874,6 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             stake_raise_minimum_delegation_to_1_sol::id(),
             "Raise minimum stake delegation to 1.0 SOL #24357",
-        ),
-        (
-            stake_minimum_delegation_for_rewards::id(),
-            "stakes must be at least the minimum delegation to earn rewards",
         ),
         (
             add_set_compute_unit_price_ix::id(),
@@ -2439,6 +2452,22 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
             "SIMD-0326: Alpenglow: new consensus algorithm",
         ),
         (
+            reduce_slot_time_to_350ms::id(),
+            "SIMD-0525: Reduce slot time to 350ms",
+        ),
+        (
+            reduce_slot_time_to_300ms::id(),
+            "SIMD-0525: Reduce slot time to 300ms",
+        ),
+        (
+            reduce_slot_time_to_250ms::id(),
+            "SIMD-0525: Reduce slot time to 250ms",
+        ),
+        (
+            reduce_slot_time_to_200ms::id(),
+            "SIMD-0525: Reduce slot time to 200ms",
+        ),
+        (
             disable_zk_elgamal_proof_program::id(),
             "Disables zk-elgamal-proof program",
         ),
@@ -2598,6 +2627,22 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
             "SIMD-0392: Relaxation of post-execution min_balance check",
         ),
         (enable_tx_v1::id(), "SIMD-0385: Transaction V1"),
+        (
+            define_ltds_fee_only_semantics::id(),
+            "SIMD-0186 Amendment: Define fee-only semantics",
+        ),
+        (
+            set_lamports_per_byte_to_6960::id(),
+            "SIMD-0438: Reset lamports per byte to legacy value of 6960",
+        ),
+        (
+            validate_chained_block_id_2::id(),
+            "SIMD-340: Encompassing check for validate chained block ID",
+        ),
+        (
+            upgrade_bpf_stake_program_to_v5_1::id(),
+            "SIMD-0391: Upgrade BPF Stake Program to v5.1.0 (fixed-point warmup/cooldown)",
+        ),
         (
             on_chain_epoch_stakes::id(),
             "SIMD-0511: On-chain epoch stakes accounts",

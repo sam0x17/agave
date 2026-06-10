@@ -920,33 +920,25 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             .for_each(f);
     }
 
-    /// Updates the given pubkey at the given slot with the new account information.
-    /// on return, the index's previous account info may be returned in 'reclaims' depending on 'previous_slot_entry_was_cached'
+    /// Updates the primary index for `pubkey` at `new_slot` with `account_info`.
+    ///
+    /// Does NOT update the secondary indexes — callers that need that must update separately.
+    /// The primary and secondary indexes are not updated atomically, and a brief inconsistency is
+    /// acceptable: the secondary index is only consulted for `scan`, which is only supported on
+    /// frozen banks, and is never used as a source of truth for gets/stores.
+    ///
+    /// On return, the previous account info may be returned in `reclaims` depending on `reclaim`.
     pub fn upsert(
         &self,
         new_slot: Slot,
         old_slot: Slot,
         pubkey: &Pubkey,
-        account: &impl ReadableAccount,
-        account_indexes: &AccountSecondaryIndexes,
         account_info: T,
         reclaims: &mut ReclaimsSlotList<T>,
         reclaim: UpsertReclaim,
     ) {
         // vast majority of updates are to item already in accounts index, so store as raw to avoid unnecessary allocations
         let store_raw = true;
-
-        // We don't atomically update both primary index and secondary index together.
-        // This certainly creates a small time window with inconsistent state across the two indexes.
-        // However, this is acceptable because:
-        //
-        //  - A strict consistent view at any given moment of time is not necessary, because the only
-        //  use case for the secondary index is `scan`, and `scans` are only supported/require consistency
-        //  on frozen banks, and this inconsistency is only possible on working banks.
-        //
-        //  - The secondary index is never consulted as primary source of truth for gets/stores.
-        //  So, what the accounts_index sees alone is sufficient as a source of truth for other non-scan
-        //  account operations.
         let new_item = PreAllocatedAccountMapEntry::new(
             new_slot,
             account_info,
@@ -954,9 +946,19 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
             store_raw,
         );
         let map = self.get_bin(pubkey);
-
         map.upsert(pubkey, new_item, Some(old_slot), reclaims, reclaim);
-        self.update_secondary_indexes(pubkey, account, account_indexes);
+    }
+
+    /// Replaces the slot list entry at `old_slot` with `(new_slot, account_info)` for `pubkey`.
+    ///
+    /// Used by the shrink path: the account already exists in the index at `old_slot`, and
+    /// shrink is rewriting it into a new storage at `new_slot`. The previous entry is discarded
+    /// (no reclaims are returned — the caller manages the source storage's alive-bytes accounting).
+    ///
+    /// Panics if `old_slot` is not present in the slot list.
+    pub fn replace(&self, new_slot: Slot, old_slot: Slot, pubkey: &Pubkey, account_info: T) {
+        let map = self.get_bin(pubkey);
+        map.replace(pubkey, (new_slot, account_info), old_slot);
     }
 
     pub fn ref_count_from_storage(&self, pubkey: &Pubkey) -> RefCount {
@@ -1351,16 +1353,7 @@ mod tests {
         let key = solana_pubkey::new_rand();
         let index = AccountsIndex::<bool, bool>::default_for_tests();
         let mut gc = ReclaimsSlotList::new();
-        index.upsert(
-            0,
-            0,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            true,
-            &mut gc,
-            UPSERT_RECLAIM_TEST_DEFAULT,
-        );
+        index.upsert(0, 0, &key, true, &mut gc, UPSERT_RECLAIM_TEST_DEFAULT);
         assert!(gc.is_empty());
 
         let ancestors = Ancestors::default();
@@ -1520,8 +1513,6 @@ mod tests {
             slot,
             slot,
             &pubkey,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
             account_info,
             &mut gc,
             UPSERT_RECLAIM_TEST_DEFAULT,
@@ -1549,8 +1540,6 @@ mod tests {
                 slot,
                 slot,
                 &pubkey,
-                &AccountSharedData::default(),
-                &AccountSecondaryIndexes::default(),
                 account_info,
                 &mut gc,
                 UpsertReclaim::IgnoreReclaims,
@@ -1591,8 +1580,6 @@ mod tests {
                     slot,
                     slot,
                     pubkey,
-                    &AccountSharedData::default(),
-                    &AccountSecondaryIndexes::default(),
                     true,
                     &mut gc,
                     UpsertReclaim::IgnoreReclaims,
@@ -1713,16 +1700,7 @@ mod tests {
         match upsert_method {
             Some(upsert_method) => {
                 // insert first entry for pubkey. This will use new_entry_after_update and not call update.
-                index.upsert(
-                    slot0,
-                    slot0,
-                    &key,
-                    &AccountSharedData::default(),
-                    &AccountSecondaryIndexes::default(),
-                    account_infos[0],
-                    &mut gc,
-                    upsert_method,
-                );
+                index.upsert(slot0, slot0, &key, account_infos[0], &mut gc, upsert_method);
             }
             None => {
                 let mut items = vec![(key, account_infos[0])];
@@ -1755,16 +1733,7 @@ mod tests {
         match upsert_method {
             Some(upsert_method) => {
                 // insert second entry for pubkey. This will use update and NOT use new_entry_after_update.
-                index.upsert(
-                    slot1,
-                    slot1,
-                    &key,
-                    &AccountSharedData::default(),
-                    &AccountSecondaryIndexes::default(),
-                    account_infos[1],
-                    &mut gc,
-                    upsert_method,
-                );
+                index.upsert(slot1, slot1, &key, account_infos[1], &mut gc, upsert_method);
             }
             None => {
                 // this has the effect of aging out everything in the in-mem cache
@@ -1897,16 +1866,7 @@ mod tests {
         let key = solana_pubkey::new_rand();
         let index = AccountsIndex::<bool, bool>::default_for_tests();
         let mut gc = ReclaimsSlotList::new();
-        index.upsert(
-            0,
-            0,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            true,
-            &mut gc,
-            UPSERT_RECLAIM_TEST_DEFAULT,
-        );
+        index.upsert(0, 0, &key, true, &mut gc, UPSERT_RECLAIM_TEST_DEFAULT);
         assert!(gc.is_empty());
 
         let ancestors = Ancestors::from(vec![1]);
@@ -1935,8 +1895,6 @@ mod tests {
                 slot,
                 slot,
                 &key,
-                &AccountSharedData::default(),
-                &AccountSecondaryIndexes::default(),
                 value,
                 &mut reclaims,
                 UpsertReclaim::PopulateReclaims,
@@ -1946,8 +1904,6 @@ mod tests {
                 slot,
                 slot,
                 &key,
-                &AccountSharedData::default(),
-                &AccountSecondaryIndexes::default(),
                 value,
                 &mut reclaims,
                 UpsertReclaim::PopulateReclaims,
@@ -1959,8 +1915,6 @@ mod tests {
                 slot,
                 slot,
                 &key,
-                &AccountSharedData::default(),
-                &AccountSecondaryIndexes::default(),
                 value,
                 &mut reclaims,
                 // since IgnoreReclaims, we should expect reclaims to be empty
@@ -1981,8 +1935,6 @@ mod tests {
                 slot,
                 slot,
                 &key,
-                &AccountSharedData::default(),
-                &AccountSecondaryIndexes::default(),
                 value,
                 &mut reclaims,
                 UpsertReclaim::PopulateReclaims,
@@ -1992,8 +1944,6 @@ mod tests {
                 slot,
                 slot,
                 &key,
-                &AccountSharedData::default(),
-                &AccountSecondaryIndexes::default(),
                 value,
                 &mut reclaims,
                 UpsertReclaim::PopulateReclaims,
@@ -2004,8 +1954,6 @@ mod tests {
                 slot,
                 slot,
                 &key,
-                &AccountSharedData::default(),
-                &AccountSecondaryIndexes::default(),
                 value,
                 &mut reclaims,
                 // since IgnoreReclaims, we should expect reclaims to be empty
@@ -2021,16 +1969,7 @@ mod tests {
         let key = solana_pubkey::new_rand();
         let index = AccountsIndex::<bool, bool>::default_for_tests();
         let mut gc = ReclaimsSlotList::new();
-        index.upsert(
-            0,
-            0,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            true,
-            &mut gc,
-            UPSERT_RECLAIM_TEST_DEFAULT,
-        );
+        index.upsert(0, 0, &key, true, &mut gc, UPSERT_RECLAIM_TEST_DEFAULT);
         assert!(gc.is_empty());
 
         let ancestors = Ancestors::from(vec![0]);
@@ -2069,8 +2008,6 @@ mod tests {
                 root_slot,
                 root_slot,
                 &new_pubkey,
-                &AccountSharedData::default(),
-                &AccountSecondaryIndexes::default(),
                 true,
                 &mut ReclaimsSlotList::new(),
                 UPSERT_RECLAIM_TEST_DEFAULT,
@@ -2086,8 +2023,6 @@ mod tests {
                 root_slot,
                 root_slot,
                 &Pubkey::default(),
-                &AccountSharedData::default(),
-                &AccountSecondaryIndexes::default(),
                 true,
                 &mut ReclaimsSlotList::new(),
                 UPSERT_RECLAIM_TEST_DEFAULT,
@@ -2136,16 +2071,7 @@ mod tests {
         let key = solana_pubkey::new_rand();
         let index = AccountsIndex::<bool, bool>::default_for_tests();
         let mut gc = ReclaimsSlotList::new();
-        index.upsert(
-            0,
-            0,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            true,
-            &mut gc,
-            UPSERT_RECLAIM_TEST_DEFAULT,
-        );
+        index.upsert(0, 0, &key, true, &mut gc, UPSERT_RECLAIM_TEST_DEFAULT);
         assert!(gc.is_empty());
 
         index.add_root(0);
@@ -2185,16 +2111,7 @@ mod tests {
         let index = AccountsIndex::<u64, u64>::default_for_tests();
         let ancestors = Ancestors::from(vec![0]);
         let mut gc = ReclaimsSlotList::new();
-        index.upsert(
-            0,
-            0,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            1,
-            &mut gc,
-            UPSERT_RECLAIM_TEST_DEFAULT,
-        );
+        index.upsert(0, 0, &key, 1, &mut gc, UPSERT_RECLAIM_TEST_DEFAULT);
         assert!(gc.is_empty());
         index
             .get_with_and_then(&key, &ancestors, false, |(slot, account_info)| {
@@ -2204,16 +2121,7 @@ mod tests {
             .unwrap();
 
         let mut gc = ReclaimsSlotList::new();
-        index.upsert(
-            0,
-            0,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            0,
-            &mut gc,
-            UPSERT_RECLAIM_TEST_DEFAULT,
-        );
+        index.upsert(0, 0, &key, 0, &mut gc, UPSERT_RECLAIM_TEST_DEFAULT);
         assert_eq!(gc, ReclaimsSlotList::from([(0, 1)]));
         index
             .get_with_and_then(&key, &ancestors, false, |(slot, account_info)| {
@@ -2230,27 +2138,9 @@ mod tests {
         let index = AccountsIndex::<bool, bool>::default_for_tests();
         let ancestors = Ancestors::from(vec![0]);
         let mut gc = ReclaimsSlotList::new();
-        index.upsert(
-            0,
-            0,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            true,
-            &mut gc,
-            UpsertReclaim::PopulateReclaims,
-        );
+        index.upsert(0, 0, &key, true, &mut gc, UpsertReclaim::PopulateReclaims);
         assert!(gc.is_empty());
-        index.upsert(
-            1,
-            1,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            false,
-            &mut gc,
-            UpsertReclaim::PopulateReclaims,
-        );
+        index.upsert(1, 1, &key, false, &mut gc, UpsertReclaim::PopulateReclaims);
         assert!(gc.is_empty());
         index
             .get_with_and_then(&key, &ancestors, false, |(slot, account_info)| {
@@ -2272,60 +2162,15 @@ mod tests {
         let key = solana_pubkey::new_rand();
         let index = AccountsIndex::<bool, bool>::default_for_tests();
         let mut gc = ReclaimsSlotList::new();
-        index.upsert(
-            0,
-            0,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            true,
-            &mut gc,
-            UpsertReclaim::PopulateReclaims,
-        );
+        index.upsert(0, 0, &key, true, &mut gc, UpsertReclaim::PopulateReclaims);
         assert!(gc.is_empty());
-        index.upsert(
-            1,
-            1,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            false,
-            &mut gc,
-            UpsertReclaim::PopulateReclaims,
-        );
-        index.upsert(
-            2,
-            2,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            true,
-            &mut gc,
-            UpsertReclaim::PopulateReclaims,
-        );
-        index.upsert(
-            3,
-            3,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            true,
-            &mut gc,
-            UpsertReclaim::PopulateReclaims,
-        );
+        index.upsert(1, 1, &key, false, &mut gc, UpsertReclaim::PopulateReclaims);
+        index.upsert(2, 2, &key, true, &mut gc, UpsertReclaim::PopulateReclaims);
+        index.upsert(3, 3, &key, true, &mut gc, UpsertReclaim::PopulateReclaims);
         index.add_root(0);
         index.add_root(1);
         index.add_root(3);
-        index.upsert(
-            4,
-            4,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            true,
-            &mut gc,
-            UpsertReclaim::PopulateReclaims,
-        );
+        index.upsert(4, 4, &key, true, &mut gc, UpsertReclaim::PopulateReclaims);
 
         // Updating index should not purge older roots, only purges
         // previous updates within the same slot
@@ -2366,8 +2211,6 @@ mod tests {
             0,
             0,
             &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
             CacheableIndexValueTest(true),
             &mut reclaims,
             UPSERT_RECLAIM_TEST_DEFAULT,
@@ -2379,8 +2222,6 @@ mod tests {
             0,
             0,
             &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
             CacheableIndexValueTest(false),
             &mut reclaims,
             UPSERT_RECLAIM_TEST_DEFAULT,
@@ -2398,8 +2239,6 @@ mod tests {
             0,
             0,
             &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
             CacheableIndexValueTest(false),
             &mut reclaims,
             UPSERT_RECLAIM_TEST_DEFAULT,
@@ -2415,6 +2254,100 @@ mod tests {
         assert_eq!(slot_list_len, 1);
     }
 
+    #[test]
+    fn test_replace_same_slot() {
+        // When new_slot == old_slot, replace acts as an in-place update of the account_info.
+        let key = solana_pubkey::new_rand();
+        let index = AccountsIndex::<u64, u64>::default_for_tests();
+        let mut gc = ReclaimsSlotList::new();
+
+        let slot = 5;
+        index.upsert(
+            slot,
+            slot,
+            &key,
+            100,
+            &mut gc,
+            UpsertReclaim::IgnoreReclaims,
+        );
+        assert_eq!(index.ref_count_from_storage(&key), 1);
+
+        let account_info = 200;
+
+        index.replace(slot, slot, &key, account_info);
+
+        // Slot list now holds the new account_info at the same slot.
+        let slot_list = index.get_and_then(&key, |entry| {
+            (false, entry.unwrap().slot_list_read_lock().clone_list())
+        });
+        assert_eq!(slot_list, SlotList::from([(slot, account_info)]));
+        // Replace doesn't change refcounts.
+        assert_eq!(index.ref_count_from_storage(&key), 1);
+    }
+
+    #[test]
+    fn test_replace_moves_entry_to_new_slot() {
+        // Replace finds the entry at old_slot, swaps it out for one at new_slot.
+        let key = solana_pubkey::new_rand();
+        let index = AccountsIndex::<u64, u64>::default_for_tests();
+        let mut gc = ReclaimsSlotList::new();
+
+        let old_slot = 5;
+        let new_slot = 10;
+        let account_info = 200;
+        index.upsert(
+            old_slot,
+            old_slot,
+            &key,
+            100,
+            &mut gc,
+            UpsertReclaim::IgnoreReclaims,
+        );
+        assert_eq!(index.ref_count_from_storage(&key), 1);
+
+        index.replace(new_slot, old_slot, &key, account_info);
+
+        let slot_list = index.get_and_then(&key, |entry| {
+            (false, entry.unwrap().slot_list_read_lock().clone_list())
+        });
+        assert_eq!(slot_list, SlotList::from([(new_slot, account_info)]));
+        // Moving an entry between slots must not change the ref count.
+        assert_eq!(index.ref_count_from_storage(&key), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Expected to find a slot to replace in the slot list")]
+    fn test_replace_missing_old_slot_panics() {
+        let key = solana_pubkey::new_rand();
+        let index = AccountsIndex::<u64, u64>::default_for_tests();
+        let mut gc = ReclaimsSlotList::new();
+
+        index.upsert(5, 5, &key, 100, &mut gc, UpsertReclaim::IgnoreReclaims);
+        // No entry at slot 99 — replace must panic rather than silently appending.
+        index.replace(10, 99, &key, 200);
+    }
+
+    #[test]
+    #[should_panic(expected = "Replace should only be used for uncached accounts")]
+    fn test_replace_cached_account_info_panics() {
+        // Shrink only ever rewrites uncached accounts; passing a cached AccountInfo to replace
+        // is a programming error and must trip the assertion.
+        let key = solana_pubkey::new_rand();
+        let index =
+            AccountsIndex::<CacheableIndexValueTest, CacheableIndexValueTest>::default_for_tests();
+        let mut gc = ReclaimsSlotList::new();
+
+        index.upsert(
+            5,
+            5,
+            &key,
+            CacheableIndexValueTest(false),
+            &mut gc,
+            UpsertReclaim::IgnoreReclaims,
+        );
+        index.replace(10, 5, &key, CacheableIndexValueTest(true));
+    }
+
     fn account_maps_stats_len<T: IndexValue>(index: &AccountsIndex<T, T>) -> usize {
         index.storage.storage.stats.total_count()
     }
@@ -2425,28 +2358,10 @@ mod tests {
         let index = AccountsIndex::<u64, u64>::default_for_tests();
         let mut gc = ReclaimsSlotList::new();
         assert_eq!(0, account_maps_stats_len(&index));
-        index.upsert(
-            1,
-            1,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            12,
-            &mut gc,
-            UPSERT_RECLAIM_TEST_DEFAULT,
-        );
+        index.upsert(1, 1, &key, 12, &mut gc, UPSERT_RECLAIM_TEST_DEFAULT);
         assert_eq!(1, account_maps_stats_len(&index));
 
-        index.upsert(
-            1,
-            1,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            10,
-            &mut gc,
-            UPSERT_RECLAIM_TEST_DEFAULT,
-        );
+        index.upsert(1, 1, &key, 10, &mut gc, UPSERT_RECLAIM_TEST_DEFAULT);
         assert_eq!(1, account_maps_stats_len(&index));
 
         let purges = index.purge_roots(&key);
@@ -2457,16 +2372,7 @@ mod tests {
         assert_eq!(purges, (SlotList::from([(1, 10)]), true));
 
         assert_eq!(1, account_maps_stats_len(&index));
-        index.upsert(
-            1,
-            1,
-            &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
-            9,
-            &mut gc,
-            UPSERT_RECLAIM_TEST_DEFAULT,
-        );
+        index.upsert(1, 1, &key, 9, &mut gc, UPSERT_RECLAIM_TEST_DEFAULT);
         assert_eq!(1, account_maps_stats_len(&index));
     }
 
@@ -2552,7 +2458,13 @@ mod tests {
                 *slot,
                 *slot,
                 &account_key,
-                // Make sure these accounts are added to secondary index
+                true,
+                &mut ReclaimsSlotList::new(),
+                UPSERT_RECLAIM_TEST_DEFAULT,
+            );
+            // Make sure these accounts are added to secondary index
+            index.update_secondary_indexes(
+                &account_key,
                 &AccountSharedData::create_from_existing_shared_data(
                     0,
                     Arc::new(account_data.to_vec()),
@@ -2561,9 +2473,6 @@ mod tests {
                     0,
                 ),
                 secondary_indexes,
-                true,
-                &mut ReclaimsSlotList::new(),
-                UPSERT_RECLAIM_TEST_DEFAULT,
             );
         }
 
@@ -2610,8 +2519,6 @@ mod tests {
                 slot,
                 slot,
                 &key,
-                &AccountSharedData::default(),
-                &AccountSecondaryIndexes::default(),
                 slot,
                 &mut gc,
                 UpsertReclaim::IgnoreReclaims,
@@ -2627,8 +2534,6 @@ mod tests {
             reclaim_slot + 1,
             reclaim_slot + 1,
             &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
             account_value + 1,
             &mut gc,
             UpsertReclaim::IgnoreReclaims,
@@ -2643,8 +2548,6 @@ mod tests {
             reclaim_slot,
             reclaim_slot,
             &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
             account_value,
             &mut gc,
             UpsertReclaim::ReclaimOldSlots,
@@ -2689,8 +2592,6 @@ mod tests {
             0,
             0,
             &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
             CacheableIndexValueTest(false),
             &mut gc,
             UpsertReclaim::IgnoreReclaims,
@@ -2700,8 +2601,6 @@ mod tests {
             1,
             1,
             &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
             CacheableIndexValueTest(true),
             &mut gc,
             UpsertReclaim::IgnoreReclaims,
@@ -2712,8 +2611,6 @@ mod tests {
             2,
             2,
             &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
             CacheableIndexValueTest(true),
             &mut gc,
             UpsertReclaim::IgnoreReclaims,
@@ -2724,8 +2621,6 @@ mod tests {
             2,
             2,
             &key,
-            &AccountSharedData::default(),
-            &AccountSecondaryIndexes::default(),
             CacheableIndexValueTest(false),
             &mut gc,
             UpsertReclaim::ReclaimOldSlots,
@@ -2930,6 +2825,12 @@ mod tests {
             0,
             0,
             &account_key,
+            true,
+            &mut ReclaimsSlotList::new(),
+            UPSERT_RECLAIM_TEST_DEFAULT,
+        );
+        index.update_secondary_indexes(
+            &account_key,
             &AccountSharedData::create_from_existing_shared_data(
                 0,
                 Arc::new(account_data.to_vec()),
@@ -2938,9 +2839,6 @@ mod tests {
                 0,
             ),
             &secondary_indexes,
-            true,
-            &mut ReclaimsSlotList::new(),
-            UPSERT_RECLAIM_TEST_DEFAULT,
         );
         assert!(secondary_index.index.is_empty());
         assert!(secondary_index.reverse_index.is_empty());
@@ -2950,6 +2848,12 @@ mod tests {
             0,
             0,
             &account_key,
+            true,
+            &mut ReclaimsSlotList::new(),
+            UPSERT_RECLAIM_TEST_DEFAULT,
+        );
+        index.update_secondary_indexes(
+            &account_key,
             &AccountSharedData::create_from_existing_shared_data(
                 0,
                 Arc::new(account_data[1..].to_vec()),
@@ -2958,9 +2862,6 @@ mod tests {
                 0,
             ),
             &secondary_indexes,
-            true,
-            &mut ReclaimsSlotList::new(),
-            UPSERT_RECLAIM_TEST_DEFAULT,
         );
         assert!(secondary_index.index.is_empty());
         assert!(secondary_index.reverse_index.is_empty());
@@ -3099,6 +3000,12 @@ mod tests {
             slot,
             slot,
             &account_key,
+            true,
+            &mut ReclaimsSlotList::new(),
+            UPSERT_RECLAIM_TEST_DEFAULT,
+        );
+        index.update_secondary_indexes(
+            &account_key,
             &AccountSharedData::create_from_existing_shared_data(
                 0,
                 Arc::new(account_data1.to_vec()),
@@ -3107,15 +3014,18 @@ mod tests {
                 0,
             ),
             secondary_indexes,
-            true,
-            &mut ReclaimsSlotList::new(),
-            UPSERT_RECLAIM_TEST_DEFAULT,
         );
 
         // Now write a different mint index for the same account
         index.upsert(
             slot,
             slot,
+            &account_key,
+            true,
+            &mut ReclaimsSlotList::new(),
+            UPSERT_RECLAIM_TEST_DEFAULT,
+        );
+        index.update_secondary_indexes(
             &account_key,
             &AccountSharedData::create_from_existing_shared_data(
                 0,
@@ -3125,9 +3035,6 @@ mod tests {
                 0,
             ),
             secondary_indexes,
-            true,
-            &mut ReclaimsSlotList::new(),
-            UPSERT_RECLAIM_TEST_DEFAULT,
         );
 
         // Both pubkeys will now be present in the index
@@ -3143,6 +3050,12 @@ mod tests {
             later_slot,
             later_slot,
             &account_key,
+            true,
+            &mut ReclaimsSlotList::new(),
+            UPSERT_RECLAIM_TEST_DEFAULT,
+        );
+        index.update_secondary_indexes(
+            &account_key,
             &AccountSharedData::create_from_existing_shared_data(
                 0,
                 Arc::new(account_data1.to_vec()),
@@ -3151,9 +3064,6 @@ mod tests {
                 0,
             ),
             secondary_indexes,
-            true,
-            &mut ReclaimsSlotList::new(),
-            UPSERT_RECLAIM_TEST_DEFAULT,
         );
         assert_eq!(secondary_index.get(&secondary_key1), vec![account_key]);
 
@@ -3339,16 +3249,7 @@ mod tests {
                 UpsertReclaim::IgnoreReclaims
             };
 
-            self.upsert(
-                slot,
-                slot,
-                key,
-                &AccountSharedData::default(),
-                &AccountSecondaryIndexes::default(),
-                value,
-                &mut gc,
-                reclaim_method,
-            );
+            self.upsert(slot, slot, key, value, &mut gc, reclaim_method);
             assert!(gc.is_empty());
         }
     }

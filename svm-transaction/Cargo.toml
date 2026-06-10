@@ -7,7 +7,7 @@ authors = { workspace = true }
 repository = { workspace = true }
 homepage = { workspace = true }
 license = { workspace = true }
-edition = "2024"
+edition = { workspace = true }
 
 [features]
 agave-unstable-api = []
@@ -27,3 +27,6 @@ solana-pubkey = { workspace = true, features = ["std"] }
 solana-system-interface = { workspace = true, features = ["bincode"] }
 static_assertions = { workspace = true }
 test-case = { workspace = true }
+
+[lints]
+workspace = true

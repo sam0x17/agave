@@ -2,6 +2,7 @@ use {
     crate::bank::Bank,
     agave_bls_cert_verify::cert_verify::{Error as BlsCertVerifyError, verify_base2},
     agave_votor_messages::{
+        consensus_message::Block,
         reward_certificate::{NUM_SLOTS_FOR_REWARD, NotarRewardCertificate, SkipRewardCertificate},
         vote::Vote,
     },
@@ -67,6 +68,7 @@ fn extract_slot(
 }
 
 /// Struct built by validating incoming reward certs.
+#[derive(Debug, Clone)]
 pub struct ValidatedRewardCert {
     /// List of validators that were present in the reward certs.
     validators: HashSet<Pubkey>,
@@ -111,7 +113,10 @@ impl ValidatedRewardCert {
             )?
         }
         if let Some(notar) = notar {
-            let vote = Vote::new_notarization_vote(notar.slot, notar.block_id);
+            let vote = Vote::new_notarization_vote(Block {
+                slot: notar.slot,
+                block_id: notar.block_id,
+            });
             // unwrap should be safe as we contructed the vote ourselves.
             let payload = bincode::serialize(&vote).unwrap();
             verify_base2(
@@ -131,9 +136,12 @@ impl ValidatedRewardCert {
         }))
     }
 
-    /// Returns the validators that were extracted from the reward certs.
-    pub(crate) fn into_parts(self) -> (Slot, HashSet<Pubkey>) {
-        (self.reward_slot, self.validators)
+    pub(crate) fn slot(&self) -> Slot {
+        self.reward_slot
+    }
+
+    pub(crate) fn validators(&self) -> &HashSet<Pubkey> {
+        &self.validators
     }
 
     #[cfg(test)]
@@ -234,14 +242,17 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let blockid = Hash::new_unique();
-        let notar_vote = Vote::new_notarization_vote(reward_slot, blockid);
+        let block_id = Hash::new_unique();
+        let notar_vote = Vote::new_notarization_vote(Block {
+            slot: reward_slot,
+            block_id,
+        });
         let notar_votes = (0..num_notar_validators)
             .map(|rank| new_vote(notar_vote, rank, signing_keys[rank]))
             .collect::<Vec<_>>();
         let (signature, bitmap) = build_sig_bitmap(&notar_votes);
         let notar_reward_cert =
-            NotarRewardCertificate::try_new(reward_slot, blockid, signature, bitmap).unwrap();
+            NotarRewardCertificate::try_new(reward_slot, block_id, signature, bitmap).unwrap();
 
         let skip_vote = Vote::new_skip_vote(reward_slot);
         let skip_votes = (num_notar_validators..num_validators)

@@ -18,7 +18,7 @@ use {
         },
         validator::BlockProductionMethod,
     },
-    agave_banking_stage_ingress_types::BankingPacketReceiver,
+    agave_banking_stage_ingress_types::{BankingPacketReceiver, SchedulerPriorityFloor},
     crossbeam_channel::{Receiver, Sender, unbounded},
     futures::{StreamExt, stream::FuturesUnordered},
     histogram::Histogram,
@@ -336,6 +336,7 @@ pub struct BankingStage {
     committer: Committer,
     log_messages_bytes_limit: Option<usize>,
     filter_keys: Arc<HashSet<Pubkey>>,
+    priority_floor: Arc<SchedulerPriorityFloor>,
     threads: FuturesUnordered<NamedTask<std::thread::Result<()>>>,
 }
 
@@ -357,6 +358,7 @@ impl BankingStage {
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
         filter_keys: Arc<HashSet<Pubkey>>,
+        priority_floor: Arc<SchedulerPriorityFloor>,
     ) -> BankingStageHandle {
         let committer = Committer::new(
             transaction_status_sender,
@@ -379,6 +381,7 @@ impl BankingStage {
             committer,
             log_messages_bytes_limit,
             filter_keys,
+            priority_floor,
             threads: FuturesUnordered::default(),
         };
 
@@ -556,6 +559,7 @@ impl BankingStage {
             finished_work_receiver,
             GreedySchedulerConfig::default(),
         );
+        let priority_floor = self.priority_floor.clone();
         let exit = exit.clone();
         let shutdown_signal = self.banking_shutdown_signal.clone();
         threads.push(
@@ -570,6 +574,7 @@ impl BankingStage {
                         sharable_banks,
                         scheduler,
                         worker_metrics,
+                        priority_floor,
                     );
 
                     match scheduler_controller.run() {
@@ -825,7 +830,7 @@ mod tests {
             validator::SchedulerPacing,
         },
         agave_banking_stage_ingress_types::BankingPacketBatch,
-        crossbeam_channel::unbounded,
+        crossbeam_channel::bounded,
         itertools::Itertools,
         solana_entry::{
             entry::{self, EntrySlice},
@@ -891,7 +896,7 @@ mod tests {
             poh_service,
             _entry_receiever,
         ) = create_test_recorder(bank, blockstore, None, None);
-        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let (replay_vote_sender, _replay_vote_receiver) = bounded(1024);
 
         let banking_stage = BankingStage::new_num_threads(
             BlockProductionMethod::CentralSchedulerGreedy,
@@ -911,6 +916,7 @@ mod tests {
             bank_forks,
             None,
             Arc::default(),
+            Arc::new(SchedulerPriorityFloor::new()),
         );
         drop(non_vote_sender);
         drop(tpu_vote_sender);
@@ -952,7 +958,7 @@ mod tests {
             poh_service,
             entry_receiver,
         ) = create_test_recorder(bank, blockstore, None, None);
-        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let (replay_vote_sender, _replay_vote_receiver) = bounded(1024);
 
         let banking_stage = BankingStage::new_num_threads(
             BlockProductionMethod::CentralSchedulerGreedy,
@@ -972,6 +978,7 @@ mod tests {
             bank_forks, // keep a local-copy of bank-forks so worker threads do not lose weak access to bank-forks
             None,
             Arc::default(),
+            Arc::new(SchedulerPriorityFloor::new()),
         );
 
         // good tx, and no verify
@@ -1097,7 +1104,7 @@ mod tests {
                 .expect("Expected to be able to open database ledger"),
         );
 
-        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let (replay_vote_sender, _replay_vote_receiver) = bounded(1024);
         let entry_receiver = {
             // start a banking_stage to eat verified receiver
             let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
@@ -1127,6 +1134,7 @@ mod tests {
                 bank_forks,
                 None,
                 Arc::default(),
+                Arc::new(SchedulerPriorityFloor::new()),
             );
 
             // wait for banking_stage to eat the packets
@@ -1261,7 +1269,7 @@ mod tests {
             poh_service,
             _entry_receiver,
         ) = create_test_recorder(bank.clone(), blockstore, None, None);
-        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let (replay_vote_sender, _replay_vote_receiver) = bounded(1024);
 
         let banking_stage = BankingStage::new_num_threads(
             BlockProductionMethod::CentralSchedulerGreedy,
@@ -1281,6 +1289,7 @@ mod tests {
             bank_forks,
             None,
             Arc::default(),
+            Arc::new(SchedulerPriorityFloor::new()),
         );
 
         let keypairs = (0..100).map(|_| Keypair::new()).collect_vec();
@@ -1351,7 +1360,9 @@ mod tests {
                 })
                 .unwrap()
         })
-        .for_each(|handle| handle.join().unwrap());
+        .for_each(|handle| {
+            handle.join().unwrap();
+        });
 
         banking_stage.join().unwrap();
         exit.store(true, Ordering::Relaxed);
