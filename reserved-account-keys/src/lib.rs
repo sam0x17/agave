@@ -143,7 +143,7 @@ mod epoch_stakes_ids {
     use solana_pubkey::Pubkey;
 
     pub const PROGRAM_ID: Pubkey =
-        Pubkey::from_str_const("8WDMPtpgHx5Xj3AJR2LMyXoD6ci2xDcT6GpJtAHZJwdW");
+        Pubkey::from_str_const("EpochStakes11111111111111111111111111111111");
 }
 
 // New reserved accounts should be added in alphabetical order and must specify

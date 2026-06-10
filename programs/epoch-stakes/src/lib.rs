@@ -7,7 +7,7 @@
 
 use solana_program_runtime::declare_process_instruction;
 
-solana_pubkey::declare_id!("8WDMPtpgHx5Xj3AJR2LMyXoD6ci2xDcT6GpJtAHZJwdW");
+solana_pubkey::declare_id!("EpochStakes11111111111111111111111111111111");
 
 pub const DEFAULT_COMPUTE_UNITS: u64 = 150;
 
