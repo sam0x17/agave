@@ -54,20 +54,28 @@ fn write_epoch_stakes_account(bank: &Bank, epoch: Epoch) {
         .map(|(vote_pubkey, (stake, vote_account))| {
             let view = vote_account.vote_state_view();
             let node_pubkey = *vote_account.node_pubkey();
-            // SIMD-0232 commission collector: use the on-chain inflation
-            // rewards collector if set, otherwise fall back to node_pubkey
-            // per the SIMD-0511 schema rules.
-            let commission_collector = view
+            // SIMD-0185/SIMD-0232 collectors and commissions. For vote
+            // accounts whose state predates vote account v4, fall back to
+            // the SIMD-0185 migration defaults per the SIMD-0511 schema
+            // rules: inflation rewards were previously collected into the
+            // vote account, block revenue into the validator identity.
+            let inflation_rewards_collector = view
                 .inflation_rewards_collector()
+                .copied()
+                .unwrap_or(*vote_pubkey);
+            let block_revenue_collector = view
+                .block_revenue_collector()
                 .copied()
                 .unwrap_or(node_pubkey);
             EpochStakesEntry {
                 vote_pubkey: *vote_pubkey,
                 node_pubkey,
-                commission_collector,
+                inflation_rewards_collector,
+                block_revenue_collector,
                 delegated_stake: *stake,
                 cumulative_credits: view.credits(),
-                commission: view.commission(),
+                inflation_rewards_commission_bps: view.inflation_rewards_commission(),
+                block_revenue_commission_bps: view.block_revenue_commission(),
             }
         })
         .collect();
@@ -210,13 +218,31 @@ mod tests {
             assert_eq!(entry.delegated_stake, *bank_stake);
             assert_eq!(entry.node_pubkey, *bank_vote_account.node_pubkey());
             let view = bank_vote_account.vote_state_view();
-            assert_eq!(entry.commission, view.commission());
+            assert_eq!(
+                entry.inflation_rewards_commission_bps,
+                view.inflation_rewards_commission()
+            );
+            assert_eq!(
+                entry.block_revenue_commission_bps,
+                view.block_revenue_commission()
+            );
             assert_eq!(entry.cumulative_credits, view.credits());
-            let expected_collector = view
+            let expected_inflation_collector = view
                 .inflation_rewards_collector()
                 .copied()
+                .unwrap_or(entry.vote_pubkey);
+            assert_eq!(
+                entry.inflation_rewards_collector,
+                expected_inflation_collector
+            );
+            let expected_block_revenue_collector = view
+                .block_revenue_collector()
+                .copied()
                 .unwrap_or(*bank_vote_account.node_pubkey());
-            assert_eq!(entry.commission_collector, expected_collector);
+            assert_eq!(
+                entry.block_revenue_collector,
+                expected_block_revenue_collector
+            );
         }
     }
 }

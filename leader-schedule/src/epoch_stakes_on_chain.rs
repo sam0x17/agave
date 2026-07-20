@@ -8,30 +8,36 @@
 //! ## Account Layout
 //!
 //! ```text
-//! ┌────────────────────────────────────────────────────────────┐
-//! │ Header (32 bytes)                                          │
-//! │   version: u32          — format version (currently 1)     │
-//! │   num_entries: u32      — vote accounts in table           │
-//! │   epoch: u64            — epoch these stakes are for       │
-//! │   total_stake: u64      — sum of all delegated stake       │
-//! │   _reserved: [u8; 8]    — must be zero                     │
-//! ├────────────────────────────────────────────────────────────┤
-//! │ Entries (num_entries × 128 bytes), sorted by vote_pubkey:  │
-//! │   vote_pubkey:           Pubkey  (32 bytes, offset   0)    │
-//! │   node_pubkey:           Pubkey  (32 bytes, offset  32)    │
-//! │   commission_collector:  Pubkey  (32 bytes, offset  64)    │
-//! │   delegated_stake:       u64     ( 8 bytes, offset  96)    │
-//! │   cumulative_credits:    u64     ( 8 bytes, offset 104)    │
-//! │   commission:            u8      ( 1 byte,  offset 112)    │
-//! │   _reserved:             [u8;15] (15 bytes, offset 113)    │
-//! └────────────────────────────────────────────────────────────┘
+//! ┌──────────────────────────────────────────────────────────────────┐
+//! │ Header (32 bytes)                                                │
+//! │   version: u32          — format version (currently 1)           │
+//! │   num_entries: u32      — vote accounts in table                 │
+//! │   epoch: u64            — epoch these stakes are for             │
+//! │   total_stake: u64      — sum of all delegated stake             │
+//! │   _reserved: [u8; 8]    — must be zero                           │
+//! ├──────────────────────────────────────────────────────────────────┤
+//! │ Entries (num_entries × 160 bytes), sorted by vote_pubkey:        │
+//! │   vote_pubkey:                      Pubkey  (32 B, offset   0)   │
+//! │   node_pubkey:                      Pubkey  (32 B, offset  32)   │
+//! │   inflation_rewards_collector:      Pubkey  (32 B, offset  64)   │
+//! │   block_revenue_collector:          Pubkey  (32 B, offset  96)   │
+//! │   delegated_stake:                  u64     ( 8 B, offset 128)   │
+//! │   cumulative_credits:               u64     ( 8 B, offset 136)   │
+//! │   inflation_rewards_commission_bps: u16     ( 2 B, offset 144)   │
+//! │   block_revenue_commission_bps:     u16     ( 2 B, offset 146)   │
+//! │   _reserved:                        [u8;12] (12 B, offset 148)   │
+//! └──────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! Per-entry size is 128 bytes so subsequent entries remain on a
-//! 32-byte boundary, preserving zero-copy `Pubkey` reads. The
-//! `commission_collector` field reserves space for the per-vote-account
-//! collector address introduced by SIMD-0232. Until that SIMD is active,
-//! callers MUST populate it with `node_pubkey`.
+//! Per-entry size is 160 bytes so subsequent entries remain on a
+//! 32-byte boundary, preserving zero-copy `Pubkey` reads. The collector
+//! and commission fields mirror the vote account v4 state introduced by
+//! SIMD-0185 and consumed by SIMD-0232. For vote accounts whose state
+//! predates v4, callers MUST populate the fields with the SIMD-0185
+//! migration defaults: `inflation_rewards_collector = vote_pubkey`,
+//! `block_revenue_collector = node_pubkey`,
+//! `inflation_rewards_commission_bps = 100 * commission`, and
+//! `block_revenue_commission_bps = 10_000`.
 
 use {solana_clock::Epoch, solana_pubkey::Pubkey};
 
@@ -42,17 +48,19 @@ pub const VERSION: u32 = 1;
 /// start on a 32-byte boundary.
 pub const HEADER_SIZE: usize = 32;
 
-/// Size of one entry. 128 bytes, multiple of 32 to preserve Pubkey
+/// Size of one entry. 160 bytes, multiple of 32 to preserve Pubkey
 /// alignment for every entry.
-pub const ENTRY_SIZE: usize = 128;
+pub const ENTRY_SIZE: usize = 160;
 
 // Field offsets within an entry.
 const ENTRY_VOTE_PUBKEY_OFFSET: usize = 0;
 const ENTRY_NODE_PUBKEY_OFFSET: usize = 32;
-const ENTRY_COMMISSION_COLLECTOR_OFFSET: usize = 64;
-const ENTRY_DELEGATED_STAKE_OFFSET: usize = 96;
-const ENTRY_CUMULATIVE_CREDITS_OFFSET: usize = 104;
-const ENTRY_COMMISSION_OFFSET: usize = 112;
+const ENTRY_INFLATION_REWARDS_COLLECTOR_OFFSET: usize = 64;
+const ENTRY_BLOCK_REVENUE_COLLECTOR_OFFSET: usize = 96;
+const ENTRY_DELEGATED_STAKE_OFFSET: usize = 128;
+const ENTRY_CUMULATIVE_CREDITS_OFFSET: usize = 136;
+const ENTRY_INFLATION_REWARDS_COMMISSION_BPS_OFFSET: usize = 144;
+const ENTRY_BLOCK_REVENUE_COMMISSION_BPS_OFFSET: usize = 146;
 
 /// One row in the epoch stakes table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,17 +69,23 @@ pub struct EpochStakesEntry {
     pub vote_pubkey: Pubkey,
     /// The validator identity address operating this vote account.
     pub node_pubkey: Pubkey,
-    /// Address that collects validator commission for this vote account.
-    /// Reserved for SIMD-0232. Set to `node_pubkey` until SIMD-0232 is
-    /// active.
-    pub commission_collector: Pubkey,
+    /// Address that collects the inflation rewards commission for this
+    /// vote account (SIMD-0185/SIMD-0232). Set to `vote_pubkey` for vote
+    /// accounts whose state predates vote account v4.
+    pub inflation_rewards_collector: Pubkey,
+    /// Address that collects block fee revenue for this vote account
+    /// (SIMD-0185/SIMD-0232). Set to `node_pubkey` for vote accounts
+    /// whose state predates vote account v4.
+    pub block_revenue_collector: Pubkey,
     /// Total stake delegated to this vote account, in lamports.
     pub delegated_stake: u64,
     /// Cumulative epoch credits earned by this vote account through the
     /// epoch this account represents.
     pub cumulative_credits: u64,
-    /// Validator commission as a percentage in `[0, 100]`.
-    pub commission: u8,
+    /// Inflation rewards commission in basis points `[0, 10000]`.
+    pub inflation_rewards_commission_bps: u16,
+    /// Block revenue commission in basis points `[0, 10000]`.
+    pub block_revenue_commission_bps: u16,
 }
 
 /// Serialize epoch stakes into the on-chain binary format.
@@ -102,15 +116,23 @@ pub fn serialize_epoch_stakes(entries: &[EpochStakesEntry], epoch: Epoch) -> Vec
             .copy_from_slice(entry.vote_pubkey.as_ref());
         data[base + ENTRY_NODE_PUBKEY_OFFSET..base + ENTRY_NODE_PUBKEY_OFFSET + 32]
             .copy_from_slice(entry.node_pubkey.as_ref());
-        data[base + ENTRY_COMMISSION_COLLECTOR_OFFSET
-            ..base + ENTRY_COMMISSION_COLLECTOR_OFFSET + 32]
-            .copy_from_slice(entry.commission_collector.as_ref());
+        data[base + ENTRY_INFLATION_REWARDS_COLLECTOR_OFFSET
+            ..base + ENTRY_INFLATION_REWARDS_COLLECTOR_OFFSET + 32]
+            .copy_from_slice(entry.inflation_rewards_collector.as_ref());
+        data[base + ENTRY_BLOCK_REVENUE_COLLECTOR_OFFSET
+            ..base + ENTRY_BLOCK_REVENUE_COLLECTOR_OFFSET + 32]
+            .copy_from_slice(entry.block_revenue_collector.as_ref());
         data[base + ENTRY_DELEGATED_STAKE_OFFSET..base + ENTRY_DELEGATED_STAKE_OFFSET + 8]
             .copy_from_slice(&entry.delegated_stake.to_le_bytes());
         data[base + ENTRY_CUMULATIVE_CREDITS_OFFSET..base + ENTRY_CUMULATIVE_CREDITS_OFFSET + 8]
             .copy_from_slice(&entry.cumulative_credits.to_le_bytes());
-        data[base + ENTRY_COMMISSION_OFFSET] = entry.commission;
-        // Reserved bytes [113..128] left as zero.
+        data[base + ENTRY_INFLATION_REWARDS_COMMISSION_BPS_OFFSET
+            ..base + ENTRY_INFLATION_REWARDS_COMMISSION_BPS_OFFSET + 2]
+            .copy_from_slice(&entry.inflation_rewards_commission_bps.to_le_bytes());
+        data[base + ENTRY_BLOCK_REVENUE_COMMISSION_BPS_OFFSET
+            ..base + ENTRY_BLOCK_REVENUE_COMMISSION_BPS_OFFSET + 2]
+            .copy_from_slice(&entry.block_revenue_commission_bps.to_le_bytes());
+        // Reserved bytes [148..160] left as zero.
     }
 
     data
@@ -154,6 +176,12 @@ pub fn deserialize_header(data: &[u8]) -> Option<EpochStakesHeader> {
     })
 }
 
+fn read_pubkey(data: &[u8], offset: usize) -> Option<Pubkey> {
+    Some(Pubkey::from(
+        <[u8; 32]>::try_from(&data[offset..offset + 32]).ok()?,
+    ))
+}
+
 /// Look up an entry by index.
 pub fn get_entry(data: &[u8], index: usize) -> Option<EpochStakesEntry> {
     let header = deserialize_header(data)?;
@@ -162,25 +190,11 @@ pub fn get_entry(data: &[u8], index: usize) -> Option<EpochStakesEntry> {
     }
 
     let base = HEADER_SIZE + index * ENTRY_SIZE;
-    let vote_pubkey = Pubkey::from(
-        <[u8; 32]>::try_from(
-            &data[base + ENTRY_VOTE_PUBKEY_OFFSET..base + ENTRY_VOTE_PUBKEY_OFFSET + 32],
-        )
-        .ok()?,
-    );
-    let node_pubkey = Pubkey::from(
-        <[u8; 32]>::try_from(
-            &data[base + ENTRY_NODE_PUBKEY_OFFSET..base + ENTRY_NODE_PUBKEY_OFFSET + 32],
-        )
-        .ok()?,
-    );
-    let commission_collector = Pubkey::from(
-        <[u8; 32]>::try_from(
-            &data[base + ENTRY_COMMISSION_COLLECTOR_OFFSET
-                ..base + ENTRY_COMMISSION_COLLECTOR_OFFSET + 32],
-        )
-        .ok()?,
-    );
+    let vote_pubkey = read_pubkey(data, base + ENTRY_VOTE_PUBKEY_OFFSET)?;
+    let node_pubkey = read_pubkey(data, base + ENTRY_NODE_PUBKEY_OFFSET)?;
+    let inflation_rewards_collector =
+        read_pubkey(data, base + ENTRY_INFLATION_REWARDS_COLLECTOR_OFFSET)?;
+    let block_revenue_collector = read_pubkey(data, base + ENTRY_BLOCK_REVENUE_COLLECTOR_OFFSET)?;
     let delegated_stake = u64::from_le_bytes(
         data[base + ENTRY_DELEGATED_STAKE_OFFSET..base + ENTRY_DELEGATED_STAKE_OFFSET + 8]
             .try_into()
@@ -191,15 +205,28 @@ pub fn get_entry(data: &[u8], index: usize) -> Option<EpochStakesEntry> {
             .try_into()
             .ok()?,
     );
-    let commission = data[base + ENTRY_COMMISSION_OFFSET];
+    let inflation_rewards_commission_bps = u16::from_le_bytes(
+        data[base + ENTRY_INFLATION_REWARDS_COMMISSION_BPS_OFFSET
+            ..base + ENTRY_INFLATION_REWARDS_COMMISSION_BPS_OFFSET + 2]
+            .try_into()
+            .ok()?,
+    );
+    let block_revenue_commission_bps = u16::from_le_bytes(
+        data[base + ENTRY_BLOCK_REVENUE_COMMISSION_BPS_OFFSET
+            ..base + ENTRY_BLOCK_REVENUE_COMMISSION_BPS_OFFSET + 2]
+            .try_into()
+            .ok()?,
+    );
 
     Some(EpochStakesEntry {
         vote_pubkey,
         node_pubkey,
-        commission_collector,
+        inflation_rewards_collector,
+        block_revenue_collector,
         delegated_stake,
         cumulative_credits,
-        commission,
+        inflation_rewards_commission_bps,
+        block_revenue_commission_bps,
     })
 }
 
@@ -221,10 +248,12 @@ mod tests {
         EpochStakesEntry {
             vote_pubkey: Pubkey::new_unique(),
             node_pubkey: Pubkey::new_unique(),
-            commission_collector: Pubkey::new_unique(),
+            inflation_rewards_collector: Pubkey::new_unique(),
+            block_revenue_collector: Pubkey::new_unique(),
             delegated_stake: stake,
             cumulative_credits: u64::from(seed) * 1_000,
-            commission: seed,
+            inflation_rewards_commission_bps: u16::from(seed) * 100,
+            block_revenue_commission_bps: 10_000 - u16::from(seed) * 100,
         }
     }
 
@@ -296,8 +325,8 @@ mod tests {
     fn test_account_size_mainnet_scale() {
         let num_validators = 2000;
         let expected_size = HEADER_SIZE + num_validators * ENTRY_SIZE;
-        // 32 + 256_000 = 256_032 bytes ≈ 250 KB
-        assert_eq!(expected_size, 256_032);
+        // 32 + 320_000 = 320_032 bytes ≈ 313 KB
+        assert_eq!(expected_size, 320_032);
         assert!(expected_size < 10 * 1024 * 1024);
     }
 
@@ -314,10 +343,14 @@ mod tests {
         // entry start.
         assert_eq!(ENTRY_VOTE_PUBKEY_OFFSET % 32, 0);
         assert_eq!(ENTRY_NODE_PUBKEY_OFFSET % 32, 0);
-        assert_eq!(ENTRY_COMMISSION_COLLECTOR_OFFSET % 32, 0);
+        assert_eq!(ENTRY_INFLATION_REWARDS_COLLECTOR_OFFSET % 32, 0);
+        assert_eq!(ENTRY_BLOCK_REVENUE_COLLECTOR_OFFSET % 32, 0);
         // u64 fields are 8-byte aligned.
         assert_eq!(ENTRY_DELEGATED_STAKE_OFFSET % 8, 0);
         assert_eq!(ENTRY_CUMULATIVE_CREDITS_OFFSET % 8, 0);
+        // u16 fields are 2-byte aligned.
+        assert_eq!(ENTRY_INFLATION_REWARDS_COMMISSION_BPS_OFFSET % 2, 0);
+        assert_eq!(ENTRY_BLOCK_REVENUE_COMMISSION_BPS_OFFSET % 2, 0);
         // Entry size keeps subsequent entries 32-byte aligned.
         assert_eq!(ENTRY_SIZE % 32, 0);
         // Header keeps the entries section 32-byte aligned.
