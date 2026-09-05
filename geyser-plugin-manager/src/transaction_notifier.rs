@@ -22,7 +22,7 @@ use {
 /// at the validator startup. TransactionStatusService invokes the notify_transaction method
 /// for new transactions. The implementation in turn invokes the notify_transaction of each
 /// plugin enabled with transaction notification managed by the GeyserPluginManager.
-pub(crate) struct TransactionNotifierImpl {
+pub struct TransactionNotifierImpl {
     plugin_manager: Arc<ArcSwap<GeyserPluginManager>>,
 }
 

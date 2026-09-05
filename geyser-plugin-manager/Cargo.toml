@@ -49,6 +49,7 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 agave-votor-messages = { workspace = true }
+criterion = { workspace = true }
 solana-account-decoder-client-types = { workspace = true }
 solana-bls-signatures = { workspace = true }
 solana-entry = { path = "../entry", features = ["agave-unstable-api", "dev-context-only-utils"] }
@@ -58,3 +59,7 @@ solana-transaction-error = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "transaction_notifier"
+harness = false

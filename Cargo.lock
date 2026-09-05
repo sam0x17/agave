@@ -8474,6 +8474,7 @@ dependencies = [
  "agave-votor-messages",
  "arc-swap",
  "bs58",
+ "criterion",
  "crossbeam-channel",
  "json5",
  "jsonrpc-core",
