@@ -1,0 +1,28 @@
+[package]
+name = "solana-epoch-stakes-program"
+description = "Solana Epoch Stakes program"
+documentation = "https://docs.rs/solana-epoch-stakes-program"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[lib]
+crate-type = ["lib"]
+name = "solana_epoch_stakes_program"
+
+[features]
+agave-unstable-api = []
+
+[dependencies]
+solana-clock = { workspace = true }
+solana-program-runtime = { workspace = true }
+solana-pubkey = { workspace = true }
+
+[lints]
+workspace = true

@@ -124,6 +124,16 @@ impl ReservedAccount {
     }
 }
 
+// Epoch stakes program ID. Per-epoch account PDAs cannot be enumerated, so they
+// are not individually listed in the reserved key set. The native owner rejects
+// every instruction; see SIMD-0511.
+mod epoch_stakes_ids {
+    use solana_pubkey::Pubkey;
+
+    pub const PROGRAM_ID: Pubkey =
+        Pubkey::from_str_const("EpochStakes11111111111111111111111111111111");
+}
+
 // New reserved accounts should be added in alphabetical order and must specify
 // a feature id for activation. Reserved accounts cannot be removed from this
 // list without breaking consensus.
@@ -138,6 +148,10 @@ static RESERVED_ACCOUNTS: std::sync::LazyLock<Vec<ReservedAccount>> =
             ReservedAccount::new_active(compute_budget::id()),
             ReservedAccount::new_active(config::id()),
             ReservedAccount::new_active(ed25519_program::id()),
+            ReservedAccount::new_pending(
+                epoch_stakes_ids::PROGRAM_ID,
+                agave_feature_set::on_chain_epoch_stakes::id(),
+            ),
             ReservedAccount::new_active(feature::id()),
             // "Loader V4" must remain a reserved account key, since it cannot
             // be removed without breaking consensus.
