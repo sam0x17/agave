@@ -3,15 +3,17 @@
 //! Writes one new account at every epoch boundary containing the epoch
 //! stakes (the vote-account-to-delegated-stake mapping) for the upcoming
 //! epoch. The account is addressed by a PDA keyed on the epoch number, so
-//! each epoch has stable data that the runtime writes once. See SIMD-0511
-//! for the full design.
+//! each epoch has stable data that the runtime writes once. Eight epoch
+//! accounts are retained; older accounts are closed at epoch boundaries.
+//! See SIMD-0511 for the full design.
 
 use {
     crate::bank::Bank,
     solana_account::{AccountSharedData, ReadableAccount},
     solana_clock::Epoch,
     solana_epoch_stakes_program::state::{
-        self as stakes_format, BLS_PUBKEY_COMPRESSED_SIZE, EpochStakesEntry, UNRANKED,
+        self as stakes_format, BLS_PUBKEY_COMPRESSED_SIZE, EpochStakesEntry, RETAINED_EPOCHS,
+        UNRANKED,
     },
     solana_pubkey::Pubkey,
 };
@@ -107,12 +109,33 @@ fn write_epoch_stakes_account(bank: &Bank, epoch: Epoch) {
     store_program_account(bank, &addr, &data);
 }
 
+fn close_expired_accounts(bank: &Bank) {
+    // Only the parent's retained window can contain published accounts. Limit
+    // the lookups to those eight epochs even if the bank skips several epochs.
+    // Use parent_slot so this also works without an in-memory parent bank.
+    let parent_epoch = bank.epoch_schedule().get_epoch(bank.parent_slot());
+    let first_parent_epoch = parent_epoch.saturating_sub(RETAINED_EPOCHS - 2);
+    let first_retained_epoch = bank.epoch().saturating_sub(RETAINED_EPOCHS - 2);
+    let end = first_retained_epoch.min(parent_epoch.saturating_add(2));
+    for epoch in first_parent_epoch..end {
+        let address = epoch_stakes_address(epoch);
+        if bank
+            .get_account(&address)
+            .is_some_and(|account| account.owner() == &solana_epoch_stakes_program::id())
+        {
+            // Burn the full balance, including transferred lamports. The store
+            // helper also subtracts the closed account's data size.
+            bank.store_account_and_update_capitalization(&address, &AccountSharedData::default());
+        }
+    }
+}
+
 /// Update the on-chain epoch stakes accounts at an epoch boundary.
 ///
 /// Called from `process_new_epoch()`. Writes a new account for the current
 /// epoch (if missing, e.g. on first activation) and for the upcoming epoch.
-/// Account data already written by the runtime is not rewritten; every epoch
-/// gets its own permanent PDA. See SIMD-0511.
+/// Retains six previous epochs, the current epoch, and the upcoming epoch.
+/// Retained account data is not rewritten or moved between addresses.
 pub(crate) fn update_on_chain_epoch_stakes(bank: &Bank) {
     let current_epoch = bank.epoch();
     let next_epoch = current_epoch + 1;
@@ -125,19 +148,57 @@ pub(crate) fn update_on_chain_epoch_stakes(bank: &Bank) {
     // epoch boundary after activation, this may be unavailable; in that case
     // the next call to this function will pick it up.
     write_epoch_stakes_account(bank, next_epoch);
+
+    close_expired_accounts(bank);
 }
 
 #[cfg(test)]
 mod tests {
     use {
         super::*,
-        crate::genesis_utils::{
-            ValidatorVoteKeypairs, bootstrap_validator_stake_lamports,
-            create_genesis_config_with_alpenglow_vote_accounts, create_genesis_config_with_leader,
+        crate::{
+            bank_forks::BankForks,
+            genesis_utils::{
+                ValidatorVoteKeypairs, bootstrap_validator_stake_lamports,
+                create_genesis_config_with_alpenglow_vote_accounts,
+                create_genesis_config_with_leader,
+            },
         },
+        agave_feature_set::on_chain_epoch_stakes,
+        solana_account::WritableAccount,
+        solana_epoch_schedule::{EpochSchedule, MINIMUM_SLOTS_PER_EPOCH},
         solana_epoch_stakes_program::state::deserialize_header,
+        solana_feature_gate_interface::{self as feature, Feature},
+        solana_genesis_config::GenesisConfig,
+        solana_leader_schedule::SlotLeader,
+        solana_rent::Rent,
         solana_sdk_ids::system_program,
+        std::{
+            collections::BTreeMap,
+            sync::{Arc, RwLock},
+        },
     };
+
+    fn retention_test_genesis() -> GenesisConfig {
+        let mut genesis_config = create_genesis_config_with_leader(
+            0,
+            &Pubkey::new_unique(),
+            bootstrap_validator_stake_lamports(),
+        )
+        .genesis_config;
+        genesis_config.epoch_schedule =
+            EpochSchedule::custom(MINIMUM_SLOTS_PER_EPOCH, MINIMUM_SLOTS_PER_EPOCH, false);
+        genesis_config
+    }
+
+    fn bank_at_epoch(
+        bank_forks: &Arc<RwLock<BankForks>>,
+        parent: Arc<Bank>,
+        epoch: Epoch,
+    ) -> Arc<Bank> {
+        let slot = parent.epoch_schedule().get_first_slot_in_epoch(epoch);
+        Bank::new_from_parent_with_bank_forks(bank_forks, parent, SlotLeader::default(), slot)
+    }
 
     #[test]
     fn test_pda_derivation_is_deterministic() {
@@ -209,29 +270,203 @@ mod tests {
 
     #[test]
     fn test_prefunded_pda_does_not_block_write() {
-        let leader_pubkey = solana_pubkey::new_rand();
-        let genesis_config = create_genesis_config_with_leader(
-            0,
-            &leader_pubkey,
-            bootstrap_validator_stake_lamports(),
-        )
-        .genesis_config;
+        let mut genesis_config = retention_test_genesis();
+        genesis_config.rent = Rent::default();
 
-        let bank = Bank::new_for_tests(&genesis_config);
-        let epoch = bank.epoch();
-        let address = epoch_stakes_address(epoch);
-        let prefunded_lamports = 42;
+        for above_minimum in [false, true] {
+            let bank = Bank::new_for_tests(&genesis_config);
+            let epoch = bank.epoch();
+            let address = epoch_stakes_address(epoch);
+            let data_len = stakes_format::HEADER_SIZE
+                + bank.epoch_vote_accounts(epoch).unwrap().len() * stakes_format::ENTRY_SIZE;
+            let minimum_balance = bank.rent_collector().rent.minimum_balance(data_len).max(1);
+            let prefunded_lamports = if above_minimum {
+                minimum_balance + 42
+            } else {
+                minimum_balance / 2
+            };
+            bank.store_account_and_update_capitalization(
+                &address,
+                &AccountSharedData::new(prefunded_lamports, 0, &system_program::id()),
+            );
+            let capitalization = bank.capitalization();
+
+            write_epoch_stakes_account(&bank, epoch);
+
+            let account = bank.get_account(&address).unwrap();
+            assert_eq!(account.owner(), &solana_epoch_stakes_program::id());
+            assert_eq!(account.lamports(), minimum_balance.max(prefunded_lamports));
+            assert_eq!(deserialize_header(account.data()).unwrap().epoch, epoch);
+            assert_eq!(
+                bank.capitalization(),
+                capitalization + minimum_balance.saturating_sub(prefunded_lamports),
+            );
+        }
+    }
+
+    #[test]
+    fn test_epoch_boundaries_retain_eight_immutable_accounts() {
+        let (mut bank, bank_forks) =
+            Bank::new_for_tests(&retention_test_genesis()).wrap_with_bank_forks_for_tests();
+        let mut snapshots = BTreeMap::new();
+
+        for current_epoch in 1..=12 {
+            bank = bank_at_epoch(&bank_forks, bank, current_epoch);
+            let accounts = bank
+                .get_program_accounts(&solana_epoch_stakes_program::id())
+                .unwrap();
+            let mut retained = Vec::new();
+            for (address, account) in accounts {
+                let epoch = deserialize_header(account.data()).unwrap().epoch;
+                assert_eq!(address, epoch_stakes_address(epoch));
+                assert_eq!(
+                    snapshots
+                        .entry(epoch)
+                        .or_insert_with(|| account.data().to_vec())
+                        .as_slice(),
+                    account.data(),
+                );
+                retained.push(epoch);
+            }
+            retained.sort_unstable();
+            assert_eq!(
+                retained,
+                (current_epoch.saturating_sub(6).max(1)..=current_epoch + 1).collect::<Vec<_>>(),
+            );
+            assert!(bank.get_account(&epoch_stakes_address(0)).is_none());
+
+            // Running the update again neither republishes expired epochs nor
+            // changes the supply or account-data accounting.
+            let capitalization = bank.capitalization();
+            let data_size = bank.load_accounts_data_size();
+            update_on_chain_epoch_stakes(&bank);
+            assert_eq!(bank.capitalization(), capitalization);
+            assert_eq!(bank.load_accounts_data_size(), data_size);
+        }
+        assert!(bank.get_account(&epoch_stakes_address(5)).is_none());
+        assert!(bank.get_account(&epoch_stakes_address(6)).is_some());
+    }
+
+    #[test]
+    fn test_closure_burns_balance_and_preserves_other_owners() {
+        for current_epoch in [12, 20] {
+            let mut genesis_config = retention_test_genesis();
+            genesis_config.accounts.remove(&on_chain_epoch_stakes::id());
+            let (bank, bank_forks) =
+                Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+            let parent = bank_at_epoch(&bank_forks, bank, 7);
+            // Seed the parent's retained window. Epoch 4 was never published;
+            // epoch 2 is a system-owned placeholder, and 3 has another owner.
+            for epoch in [1, 5, 6, 7, 8] {
+                store_program_account(
+                    &parent,
+                    &epoch_stakes_address(epoch),
+                    &stakes_format::serialize_epoch_stakes(&[], epoch),
+                );
+            }
+            let donated_address = epoch_stakes_address(1);
+            let mut donated_account = parent.get_account(&donated_address).unwrap();
+            donated_account.set_lamports(donated_account.lamports() + 500);
+            parent.store_account_and_update_capitalization(&donated_address, &donated_account);
+            let placeholders = [
+                (
+                    epoch_stakes_address(2),
+                    AccountSharedData::new(42, 0, &system_program::id()),
+                ),
+                (
+                    epoch_stakes_address(3),
+                    AccountSharedData::new(43, 17, &Pubkey::new_unique()),
+                ),
+                (
+                    epoch_stakes_address(30),
+                    AccountSharedData::new(44, 0, &system_program::id()),
+                ),
+            ];
+            for (address, account) in &placeholders {
+                parent.store_account_and_update_capitalization(address, account);
+            }
+
+            let bank = bank_at_epoch(&bank_forks, parent.clone(), current_epoch);
+            let expired = if current_epoch == 12 {
+                vec![1, 5]
+            } else {
+                vec![1, 5, 6, 7, 8]
+            };
+            let mut burned_lamports = 0;
+            let mut removed_data_size = 0;
+            for epoch in &expired {
+                let account = bank.get_account(&epoch_stakes_address(*epoch)).unwrap();
+                burned_lamports += account.lamports();
+                removed_data_size += account.data().len() as u64;
+            }
+            let capitalization = bank.capitalization();
+            let data_size = bank.load_accounts_data_size();
+
+            close_expired_accounts(&bank);
+
+            assert_eq!(bank.capitalization(), capitalization - burned_lamports);
+            assert_eq!(
+                bank.load_accounts_data_size(),
+                data_size - removed_data_size
+            );
+            for epoch in expired {
+                let address = epoch_stakes_address(epoch);
+                assert!(bank.get_account(&address).is_none());
+                assert!(parent.get_account(&address).is_some());
+            }
+            for (address, account) in &placeholders {
+                assert_eq!(bank.get_account(address).as_ref(), Some(account));
+            }
+            if current_epoch == 12 {
+                for epoch in 6..=8 {
+                    let address = epoch_stakes_address(epoch);
+                    assert_eq!(bank.get_account(&address), parent.get_account(&address));
+                }
+            }
+
+            close_expired_accounts(&bank);
+            assert_eq!(bank.capitalization(), capitalization - burned_lamports);
+            assert_eq!(
+                bank.load_accounts_data_size(),
+                data_size - removed_data_size
+            );
+        }
+    }
+
+    #[test]
+    fn test_activation_and_skipped_epochs_do_not_backfill_history() {
+        let mut genesis_config = retention_test_genesis();
+        genesis_config.accounts.remove(&on_chain_epoch_stakes::id());
+        let (bank, bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        let bank = bank_at_epoch(&bank_forks, bank, 3);
+        assert!(
+            bank.get_program_accounts(&solana_epoch_stakes_program::id())
+                .unwrap()
+                .is_empty()
+        );
         bank.store_account_and_update_capitalization(
-            &address,
-            &AccountSharedData::new(prefunded_lamports, 0, &system_program::id()),
+            &on_chain_epoch_stakes::id(),
+            &feature::create_account(&Feature::default(), 1),
         );
 
-        update_on_chain_epoch_stakes(&bank);
+        let bank = bank_at_epoch(&bank_forks, bank, 4);
+        assert!(bank.feature_set.is_active(&on_chain_epoch_stakes::id()));
+        for epoch in 0..4 {
+            assert!(bank.get_account(&epoch_stakes_address(epoch)).is_none());
+        }
+        for epoch in 4..=5 {
+            assert!(bank.get_account(&epoch_stakes_address(epoch)).is_some());
+        }
 
-        let account = bank.get_account(&address).unwrap();
-        assert_eq!(account.owner(), &solana_epoch_stakes_program::id());
-        assert!(account.lamports() >= prefunded_lamports);
-        assert_eq!(deserialize_header(account.data()).unwrap().epoch, epoch);
+        // A jump past the entire retained window closes every old account.
+        // The missing current snapshot does not extend the retention window.
+        let bank = bank_at_epoch(&bank_forks, bank, 12);
+        assert!(bank.epoch_stakes(12).is_none());
+        for epoch in 0..=12 {
+            assert!(bank.get_account(&epoch_stakes_address(epoch)).is_none());
+        }
+        assert!(bank.get_account(&epoch_stakes_address(13)).is_some());
     }
 
     /// Verify the on-chain epoch stakes match what the bank has internally,

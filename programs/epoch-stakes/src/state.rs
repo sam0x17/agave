@@ -47,6 +47,10 @@ use {solana_clock::Epoch, solana_pubkey::Pubkey};
 /// Current format version.
 pub const VERSION: u32 = 1;
 
+/// Number of epoch accounts retained: the upcoming epoch, the current epoch,
+/// and six previous epochs.
+pub const RETAINED_EPOCHS: Epoch = 8;
+
 /// Size of the fixed header in bytes. Padded to 32 bytes so entries
 /// start on a 32-byte boundary.
 pub const HEADER_SIZE: usize = 32;
@@ -110,10 +114,13 @@ pub struct EpochStakesEntry {
     pub block_revenue_collector: Pubkey,
     /// Total stake delegated to this vote account, in lamports.
     pub delegated_stake: u64,
-    /// Cumulative epoch credits earned by this vote account through the
-    /// epoch this account represents.
+    /// Cumulative credits at the start of `epoch - 1`, or zero if the vote
+    /// state's credits history is empty. For a continuous counter, the
+    /// difference from the preceding snapshot is credits recorded in `epoch - 2`.
     pub cumulative_credits: u64,
     /// Inflation rewards commission in basis points `[0, 10000]`.
+    /// With SIMD-0249 active, this snapshot supplies the commission for rewards
+    /// earned in `epoch`, subject to its missing-vote-account fallback rules.
     pub inflation_rewards_commission_bps: u16,
     /// Block revenue commission in basis points `[0, 10000]`.
     pub block_revenue_commission_bps: u16,
