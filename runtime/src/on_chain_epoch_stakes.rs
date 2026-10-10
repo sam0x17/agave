@@ -1,8 +1,9 @@
 //! On-chain epoch stakes account management.
 //!
 //! Writes one new account at every epoch boundary containing the epoch
-//! stakes (the vote-account-to-delegated-stake mapping) for the upcoming
-//! epoch. The account is addressed by a PDA keyed on the epoch number, so
+//! stakes (the vote-account-to-delegated-stake mapping) taken at the start
+//! of the current epoch, for use by consensus in the following epoch. The account
+//! is addressed by a PDA keyed on the snapshot epoch number, so
 //! each epoch has stable data that the runtime writes once. Eight epoch
 //! accounts are retained; older accounts are closed at epoch boundaries.
 //! See SIMD-0511 for the full design.
@@ -57,7 +58,9 @@ fn write_epoch_stakes_account(bank: &Bank, epoch: Epoch) {
             return;
         }
     }
-    let Some(epoch_stakes) = bank.epoch_stakes(epoch) else {
+    // The bank indexes this snapshot by its consensus epoch, one epoch later
+    // than the snapshot epoch used by the on-chain address and header.
+    let Some(epoch_stakes) = bank.epoch_stakes(epoch + 1) else {
         return;
     };
     let vote_accounts = epoch_stakes.stakes().vote_accounts().as_ref();
@@ -72,24 +75,9 @@ fn write_epoch_stakes_account(bank: &Bank, epoch: Epoch) {
         .map(|(vote_pubkey, (stake, vote_account))| {
             let view = vote_account.vote_state_view();
             let node_pubkey = *vote_account.node_pubkey();
-            // SIMD-0185/SIMD-0232 collectors and commissions. For vote
-            // accounts whose state predates vote account v4, fall back to
-            // the SIMD-0185 migration defaults per the SIMD-0511 schema
-            // rules: inflation rewards were previously collected into the
-            // vote account, block revenue into the validator identity.
-            let inflation_rewards_collector = view
-                .inflation_rewards_collector()
-                .copied()
-                .unwrap_or(*vote_pubkey);
-            let block_revenue_collector = view
-                .block_revenue_collector()
-                .copied()
-                .unwrap_or(node_pubkey);
             EpochStakesEntry {
                 vote_pubkey: *vote_pubkey,
                 node_pubkey,
-                inflation_rewards_collector,
-                block_revenue_collector,
                 delegated_stake: *stake,
                 cumulative_credits: view.credits(),
                 inflation_rewards_commission_bps: view.inflation_rewards_commission(),
@@ -114,9 +102,9 @@ fn close_expired_accounts(bank: &Bank) {
     // the lookups to those eight epochs even if the bank skips several epochs.
     // Use parent_slot so this also works without an in-memory parent bank.
     let parent_epoch = bank.epoch_schedule().get_epoch(bank.parent_slot());
-    let first_parent_epoch = parent_epoch.saturating_sub(RETAINED_EPOCHS - 2);
-    let first_retained_epoch = bank.epoch().saturating_sub(RETAINED_EPOCHS - 2);
-    let end = first_retained_epoch.min(parent_epoch.saturating_add(2));
+    let first_parent_epoch = parent_epoch.saturating_sub(RETAINED_EPOCHS - 1);
+    let first_retained_epoch = bank.epoch().saturating_sub(RETAINED_EPOCHS - 1);
+    let end = first_retained_epoch.min(parent_epoch.saturating_add(1));
     for epoch in first_parent_epoch..end {
         let address = epoch_stakes_address(epoch);
         if bank
@@ -132,23 +120,15 @@ fn close_expired_accounts(bank: &Bank) {
 
 /// Update the on-chain epoch stakes accounts at an epoch boundary.
 ///
-/// Called from `process_new_epoch()`. Writes a new account for the current
-/// epoch (if missing, e.g. on first activation) and for the upcoming epoch.
-/// Retains six previous epochs, the current epoch, and the upcoming epoch.
-/// Retained account data is not rewritten or moved between addresses.
+/// Called from `process_new_epoch()`. Writes the snapshot taken at the start
+/// of the current epoch, for use by consensus in the following epoch. Also
+/// publishes the previous snapshot if available and missing, as on activation.
+/// Retains the current snapshot and seven previous epochs.
 pub(crate) fn update_on_chain_epoch_stakes(bank: &Bank) {
-    let current_epoch = bank.epoch();
-    let next_epoch = current_epoch + 1;
-
-    // On first activation, the current epoch's account doesn't exist yet.
-    // On subsequent calls this is a no-op because the write helper early-returns.
-    write_epoch_stakes_account(bank, current_epoch);
-
-    // Write the next epoch's account if stakes are known. On the very first
-    // epoch boundary after activation, this may be unavailable; in that case
-    // the next call to this function will pick it up.
-    write_epoch_stakes_account(bank, next_epoch);
-
+    if let Some(previous_epoch) = bank.epoch().checked_sub(1) {
+        write_epoch_stakes_account(bank, previous_epoch);
+    }
+    write_epoch_stakes_account(bank, bank.epoch());
     close_expired_accounts(bank);
 }
 
@@ -165,7 +145,7 @@ mod tests {
             },
         },
         agave_feature_set::on_chain_epoch_stakes,
-        solana_account::WritableAccount,
+        solana_account::{WritableAccount, state_traits::StateMutWincode},
         solana_epoch_schedule::{EpochSchedule, MINIMUM_SLOTS_PER_EPOCH},
         solana_epoch_stakes_program::state::deserialize_header,
         solana_feature_gate_interface::{self as feature, Feature},
@@ -173,6 +153,7 @@ mod tests {
         solana_leader_schedule::SlotLeader,
         solana_rent::Rent,
         solana_sdk_ids::system_program,
+        solana_vote_interface::state::{VoteStateV4, VoteStateVersions},
         std::{
             collections::BTreeMap,
             sync::{Arc, RwLock},
@@ -201,6 +182,88 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_epoch_tracks_boundary_and_preserves_raw_commissions() {
+        let (bank, bank_forks) =
+            Bank::new_for_tests(&retention_test_genesis()).wrap_with_bank_forks_for_tests();
+        let vote_pubkey = *bank.epoch_vote_accounts(1).unwrap().keys().next().unwrap();
+        let old_commission = bank.epoch_vote_accounts(1).unwrap()[&vote_pubkey]
+            .1
+            .vote_state_view()
+            .inflation_rewards_commission();
+        let mut vote_account = bank.get_account(&vote_pubkey).unwrap();
+        let mut vote_state = VoteStateV4::deserialize(vote_account.data(), &vote_pubkey).unwrap();
+        vote_state.inflation_rewards_commission_bps = 10_001;
+        vote_state.block_revenue_commission_bps = u16::MAX;
+        vote_state.epoch_credits.push((0, 42, 0));
+        vote_account
+            .set_state(&VoteStateVersions::new_v4(vote_state))
+            .unwrap();
+        bank.store_account(&vote_pubkey, &vote_account);
+
+        let bank = bank_at_epoch(&bank_forks, bank, 1);
+        let address = epoch_stakes_address(1);
+        let snapshot = bank.get_account(&address).unwrap();
+        assert_eq!(deserialize_header(snapshot.data()).unwrap().epoch, 1);
+        let entry = stakes_format::get_entry(snapshot.data(), 0).unwrap();
+        assert_eq!(entry.vote_pubkey, vote_pubkey);
+        assert_eq!(entry.inflation_rewards_commission_bps, 10_001);
+        assert_eq!(entry.block_revenue_commission_bps, u16::MAX);
+        assert_eq!(entry.cumulative_credits, 42);
+        let previous_snapshot = bank.get_account(&epoch_stakes_address(0)).unwrap();
+        assert_eq!(
+            stakes_format::get_entry(previous_snapshot.data(), 0)
+                .unwrap()
+                .inflation_rewards_commission_bps,
+            old_commission,
+        );
+        assert_eq!(
+            bank.epoch_vote_accounts(1).unwrap()[&vote_pubkey]
+                .1
+                .vote_state_view()
+                .inflation_rewards_commission(),
+            old_commission,
+        );
+        assert!(bank.get_account(&epoch_stakes_address(2)).is_none());
+
+        // Changes later in the epoch must not replace the boundary snapshot.
+        let mut live_account = bank.get_account(&vote_pubkey).unwrap();
+        let mut live_state = VoteStateV4::deserialize(live_account.data(), &vote_pubkey).unwrap();
+        live_state.inflation_rewards_commission_bps = 2_000;
+        live_account
+            .set_state(&VoteStateVersions::new_v4(live_state))
+            .unwrap();
+        bank.store_account(&vote_pubkey, &live_account);
+        update_on_chain_epoch_stakes(&bank);
+        assert_eq!(bank.get_account(&address).unwrap().data(), snapshot.data());
+    }
+
+    #[test]
+    fn test_epoch_stakes_accounts_accept_transfers_without_changing_data() {
+        let genesis = create_genesis_config_with_leader(
+            1_000_000_000,
+            &Pubkey::new_unique(),
+            bootstrap_validator_stake_lamports(),
+        );
+        let bank = Bank::new_for_tests(&genesis.genesis_config);
+        update_on_chain_epoch_stakes(&bank);
+        let address = epoch_stakes_address(bank.epoch());
+        for destination in [address, solana_epoch_stakes_program::id()] {
+            let before = bank.get_account(&destination).unwrap();
+            let transfer = solana_system_transaction::transfer(
+                &genesis.mint_keypair,
+                &destination,
+                1_000_000,
+                bank.last_blockhash(),
+            );
+            bank.process_transaction(&transfer).unwrap();
+            let after = bank.get_account(&destination).unwrap();
+            assert_eq!(after.lamports(), before.lamports() + 1_000_000);
+            assert_eq!(after.data(), before.data());
+            assert_eq!(after.owner(), before.owner());
+        }
+    }
+
+    #[test]
     fn test_pda_derivation_is_deterministic() {
         assert_eq!(epoch_stakes_address(0), epoch_stakes_address(0));
         assert_eq!(epoch_stakes_address(42), epoch_stakes_address(42));
@@ -219,7 +282,7 @@ mod tests {
 
         let bank = Bank::new_for_tests(&genesis_config);
         let epoch = bank.epoch();
-        assert!(bank.epoch_vote_accounts(epoch).is_some());
+        assert!(bank.epoch_vote_accounts(epoch + 1).is_some());
 
         update_on_chain_epoch_stakes(&bank);
 
@@ -278,7 +341,7 @@ mod tests {
             let epoch = bank.epoch();
             let address = epoch_stakes_address(epoch);
             let data_len = stakes_format::HEADER_SIZE
-                + bank.epoch_vote_accounts(epoch).unwrap().len() * stakes_format::ENTRY_SIZE;
+                + bank.epoch_vote_accounts(epoch + 1).unwrap().len() * stakes_format::ENTRY_SIZE;
             let minimum_balance = bank.rent_collector().rent.minimum_balance(data_len).max(1);
             let prefunded_lamports = if above_minimum {
                 minimum_balance + 42
@@ -331,9 +394,12 @@ mod tests {
             retained.sort_unstable();
             assert_eq!(
                 retained,
-                (current_epoch.saturating_sub(6).max(1)..=current_epoch + 1).collect::<Vec<_>>(),
+                (current_epoch.saturating_sub(7)..=current_epoch).collect::<Vec<_>>(),
             );
-            assert!(bank.get_account(&epoch_stakes_address(0)).is_none());
+            assert!(
+                bank.get_account(&epoch_stakes_address(current_epoch + 1))
+                    .is_none()
+            );
 
             // Running the update again neither republishes expired epochs nor
             // changes the supply or account-data accounting.
@@ -343,8 +409,8 @@ mod tests {
             assert_eq!(bank.capitalization(), capitalization);
             assert_eq!(bank.load_accounts_data_size(), data_size);
         }
-        assert!(bank.get_account(&epoch_stakes_address(5)).is_none());
-        assert!(bank.get_account(&epoch_stakes_address(6)).is_some());
+        assert!(bank.get_account(&epoch_stakes_address(4)).is_none());
+        assert!(bank.get_account(&epoch_stakes_address(5)).is_some());
     }
 
     #[test]
@@ -357,7 +423,7 @@ mod tests {
             let parent = bank_at_epoch(&bank_forks, bank, 7);
             // Seed the parent's retained window. Epoch 4 was never published;
             // epoch 2 is a system-owned placeholder, and 3 has another owner.
-            for epoch in [1, 5, 6, 7, 8] {
+            for epoch in [0, 1, 5, 6, 7] {
                 store_program_account(
                     &parent,
                     &epoch_stakes_address(epoch),
@@ -388,9 +454,9 @@ mod tests {
 
             let bank = bank_at_epoch(&bank_forks, parent.clone(), current_epoch);
             let expired = if current_epoch == 12 {
-                vec![1, 5]
+                vec![0, 1]
             } else {
-                vec![1, 5, 6, 7, 8]
+                vec![0, 1, 5, 6, 7]
             };
             let mut burned_lamports = 0;
             let mut removed_data_size = 0;
@@ -418,7 +484,7 @@ mod tests {
                 assert_eq!(bank.get_account(address).as_ref(), Some(account));
             }
             if current_epoch == 12 {
-                for epoch in 6..=8 {
+                for epoch in 5..=7 {
                     let address = epoch_stakes_address(epoch);
                     assert_eq!(bank.get_account(&address), parent.get_account(&address));
                 }
@@ -434,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn test_activation_and_skipped_epochs_do_not_backfill_history() {
+    fn test_activation_bootstraps_previous_snapshot_and_skips_missing_epochs() {
         let mut genesis_config = retention_test_genesis();
         genesis_config.accounts.remove(&on_chain_epoch_stakes::id());
         let (bank, bank_forks) =
@@ -452,21 +518,22 @@ mod tests {
 
         let bank = bank_at_epoch(&bank_forks, bank, 4);
         assert!(bank.feature_set.is_active(&on_chain_epoch_stakes::id()));
-        for epoch in 0..4 {
+        for epoch in 0..3 {
             assert!(bank.get_account(&epoch_stakes_address(epoch)).is_none());
         }
-        for epoch in 4..=5 {
-            assert!(bank.get_account(&epoch_stakes_address(epoch)).is_some());
-        }
+        assert!(bank.get_account(&epoch_stakes_address(3)).is_some());
+        assert!(bank.get_account(&epoch_stakes_address(4)).is_some());
+        assert!(bank.get_account(&epoch_stakes_address(5)).is_none());
 
         // A jump past the entire retained window closes every old account.
-        // The missing current snapshot does not extend the retention window.
+        // The new boundary publishes its own snapshot, not a future epoch.
         let bank = bank_at_epoch(&bank_forks, bank, 12);
         assert!(bank.epoch_stakes(12).is_none());
-        for epoch in 0..=12 {
+        for epoch in 0..12 {
             assert!(bank.get_account(&epoch_stakes_address(epoch)).is_none());
         }
-        assert!(bank.get_account(&epoch_stakes_address(13)).is_some());
+        assert!(bank.get_account(&epoch_stakes_address(12)).is_some());
+        assert!(bank.get_account(&epoch_stakes_address(13)).is_none());
     }
 
     /// Verify the on-chain epoch stakes match what the bank has internally,
@@ -483,7 +550,7 @@ mod tests {
 
         let bank = Bank::new_for_tests(&genesis_config);
         let epoch = bank.epoch();
-        let bank_vote_accounts = bank.epoch_vote_accounts(epoch).unwrap().clone();
+        let bank_vote_accounts = bank.epoch_vote_accounts(epoch + 1).unwrap().clone();
 
         update_on_chain_epoch_stakes(&bank);
         let account = bank.get_account(&epoch_stakes_address(epoch)).unwrap();
@@ -519,22 +586,6 @@ mod tests {
                 view.bls_pubkey_compressed()
                     .unwrap_or([0; BLS_PUBKEY_COMPRESSED_SIZE])
             );
-            let expected_inflation_collector = view
-                .inflation_rewards_collector()
-                .copied()
-                .unwrap_or(entry.vote_pubkey);
-            assert_eq!(
-                entry.inflation_rewards_collector,
-                expected_inflation_collector
-            );
-            let expected_block_revenue_collector = view
-                .block_revenue_collector()
-                .copied()
-                .unwrap_or(*bank_vote_account.node_pubkey());
-            assert_eq!(
-                entry.block_revenue_collector,
-                expected_block_revenue_collector
-            );
         }
     }
 
@@ -555,7 +606,10 @@ mod tests {
 
         let account = bank.get_account(&epoch_stakes_address(epoch)).unwrap();
         let entries = solana_epoch_stakes_program::state::get_all_entries(account.data()).unwrap();
-        let rank_map = bank.epoch_stakes(epoch).unwrap().bls_pubkey_to_rank_map();
+        let rank_map = bank
+            .epoch_stakes(epoch + 1)
+            .unwrap()
+            .bls_pubkey_to_rank_map();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(
