@@ -1,6 +1,6 @@
 [package]
 name = "solana-epoch-stakes-program"
-description = "Solana Epoch Stakes program"
+description = "Solana epoch stakes account format and owner address"
 documentation = "https://docs.rs/solana-epoch-stakes-program"
 version = { workspace = true }
 authors = { workspace = true }
@@ -21,7 +21,6 @@ agave-unstable-api = []
 
 [dependencies]
 solana-clock = { workspace = true }
-solana-program-runtime = { workspace = true }
 solana-pubkey = { workspace = true }
 
 [lints]

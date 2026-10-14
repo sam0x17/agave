@@ -31,7 +31,7 @@ pub fn epoch_stakes_address(epoch: Epoch) -> Pubkey {
     pubkey
 }
 
-/// Helper to create and store an account with data owned by the epoch stakes program.
+/// Store snapshot data under the dedicated epoch stakes owner address.
 fn store_program_account(bank: &Bank, dest_addr: &Pubkey, data: &[u8]) {
     let rent_exempt_minimum = bank
         .rent_collector()
@@ -121,13 +121,9 @@ fn close_expired_accounts(bank: &Bank) {
 /// Update the on-chain epoch stakes accounts at an epoch boundary.
 ///
 /// Called from `process_new_epoch()`. Writes the snapshot taken at the start
-/// of the current epoch, for use by consensus in the following epoch. Also
-/// publishes the previous snapshot if available and missing, as on activation.
-/// Retains the current snapshot and seven previous epochs.
+/// of the current epoch, for use by consensus in the following epoch. No earlier
+/// snapshot is backfilled. Retains the current snapshot and seven previous epochs.
 pub(crate) fn update_on_chain_epoch_stakes(bank: &Bank) {
-    if let Some(previous_epoch) = bank.epoch().checked_sub(1) {
-        write_epoch_stakes_account(bank, previous_epoch);
-    }
     write_epoch_stakes_account(bank, bank.epoch());
     close_expired_accounts(bank);
 }
@@ -150,9 +146,14 @@ mod tests {
         solana_epoch_stakes_program::state::deserialize_header,
         solana_feature_gate_interface::{self as feature, Feature},
         solana_genesis_config::GenesisConfig,
+        solana_instruction::{AccountMeta, Instruction},
         solana_leader_schedule::SlotLeader,
         solana_rent::Rent,
         solana_sdk_ids::system_program,
+        solana_signer::Signer,
+        solana_system_interface::instruction as system_instruction,
+        solana_transaction::Transaction,
+        solana_transaction_error::TransactionError,
         solana_vote_interface::state::{VoteStateV4, VoteStateVersions},
         std::{
             collections::BTreeMap,
@@ -209,13 +210,7 @@ mod tests {
         assert_eq!(entry.inflation_rewards_commission_bps, 10_001);
         assert_eq!(entry.block_revenue_commission_bps, u16::MAX);
         assert_eq!(entry.cumulative_credits, 42);
-        let previous_snapshot = bank.get_account(&epoch_stakes_address(0)).unwrap();
-        assert_eq!(
-            stakes_format::get_entry(previous_snapshot.data(), 0)
-                .unwrap()
-                .inflation_rewards_commission_bps,
-            old_commission,
-        );
+        assert!(bank.get_account(&epoch_stakes_address(0)).is_none());
         assert_eq!(
             bank.epoch_vote_accounts(1).unwrap()[&vote_pubkey]
                 .1
@@ -248,7 +243,7 @@ mod tests {
         update_on_chain_epoch_stakes(&bank);
         let address = epoch_stakes_address(bank.epoch());
         for destination in [address, solana_epoch_stakes_program::id()] {
-            let before = bank.get_account(&destination).unwrap();
+            let before = bank.get_account(&destination).unwrap_or_default();
             let transfer = solana_system_transaction::transfer(
                 &genesis.mint_keypair,
                 &destination,
@@ -271,7 +266,58 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_creates_current_account() {
+    fn test_non_executable_owner_preserves_snapshot_transaction_protections() {
+        let genesis = create_genesis_config_with_leader(
+            1_000_000_000,
+            &Pubkey::new_unique(),
+            bootstrap_validator_stake_lamports(),
+        );
+        let bank = Bank::new_for_tests(&genesis.genesis_config);
+        update_on_chain_epoch_stakes(&bank);
+        let address = epoch_stakes_address(bank.epoch());
+        let owner_address = solana_epoch_stakes_program::id();
+        assert!(bank.get_account(&owner_address).is_none());
+        bank.transfer(1_000_000, &genesis.mint_keypair, &owner_address)
+            .unwrap();
+        let owner = bank.get_account(&owner_address).unwrap();
+        assert_eq!(owner.owner(), &system_program::id());
+        assert!(!owner.executable());
+        assert!(owner.data().is_empty());
+        let snapshot = bank.get_account(&address).unwrap();
+
+        let transaction = |instruction| {
+            Transaction::new_signed_with_payer(
+                &[instruction],
+                Some(&genesis.mint_keypair.pubkey()),
+                &[&genesis.mint_keypair],
+                bank.last_blockhash(),
+            )
+        };
+        let invoke_owner = Instruction {
+            program_id: owner_address,
+            accounts: vec![AccountMeta::new(address, false)],
+            data: vec![],
+        };
+        assert_eq!(
+            bank.process_transaction(&transaction(invoke_owner)),
+            Err(TransactionError::InvalidProgramForExecution),
+        );
+
+        // A transaction cannot sign for the PDA. Removing the signer bit must
+        // not let system instructions change its data, owner, or balance.
+        for mut instruction in [
+            system_instruction::allocate(&address, 1),
+            system_instruction::assign(&address, &system_program::id()),
+            system_instruction::transfer(&address, &genesis.mint_keypair.pubkey(), 1),
+        ] {
+            instruction.accounts[0].is_signer = false;
+            assert!(bank.process_transaction(&transaction(instruction)).is_err());
+            assert_eq!(bank.get_account(&address).as_ref(), Some(&snapshot));
+        }
+    }
+
+    #[test]
+    fn test_publication_creates_current_account() {
         let leader_pubkey = solana_pubkey::new_rand();
         let genesis_config = create_genesis_config_with_leader(
             0,
@@ -288,14 +334,14 @@ mod tests {
 
         let stakes_account = bank
             .get_account(&epoch_stakes_address(epoch))
-            .expect("epoch stakes account should exist after bootstrap");
+            .expect("epoch stakes account should exist after publication");
 
         let header = deserialize_header(stakes_account.data()).unwrap();
         assert_eq!(header.epoch, epoch);
         assert!(header.num_entries > 0);
         assert!(header.total_stake > 0);
 
-        // Owner is the epoch stakes program.
+        // The snapshot is owned by the dedicated non-executable address.
         assert_eq!(*stakes_account.owner(), solana_epoch_stakes_program::id());
     }
 
@@ -394,7 +440,7 @@ mod tests {
             retained.sort_unstable();
             assert_eq!(
                 retained,
-                (current_epoch.saturating_sub(7)..=current_epoch).collect::<Vec<_>>(),
+                (1.max(current_epoch.saturating_sub(7))..=current_epoch).collect::<Vec<_>>(),
             );
             assert!(
                 bank.get_account(&epoch_stakes_address(current_epoch + 1))
@@ -500,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn test_activation_bootstraps_previous_snapshot_and_skips_missing_epochs() {
+    fn test_activation_publishes_only_current_snapshot_and_skips_missing_epochs() {
         let mut genesis_config = retention_test_genesis();
         genesis_config.accounts.remove(&on_chain_epoch_stakes::id());
         let (bank, bank_forks) =
@@ -518,10 +564,10 @@ mod tests {
 
         let bank = bank_at_epoch(&bank_forks, bank, 4);
         assert!(bank.feature_set.is_active(&on_chain_epoch_stakes::id()));
-        for epoch in 0..3 {
+        assert!(bank.epoch_stakes(4).is_some());
+        for epoch in 0..4 {
             assert!(bank.get_account(&epoch_stakes_address(epoch)).is_none());
         }
-        assert!(bank.get_account(&epoch_stakes_address(3)).is_some());
         assert!(bank.get_account(&epoch_stakes_address(4)).is_some());
         assert!(bank.get_account(&epoch_stakes_address(5)).is_none());
 
@@ -623,5 +669,55 @@ mod tests {
             entries[0].bls_pubkey_compressed,
             [0; BLS_PUBKEY_COMPRESSED_SIZE]
         );
+    }
+
+    #[test]
+    fn test_snapshot_retains_entries_excluded_by_rank_deduplication() {
+        for duplicate_bls_key in [false, true] {
+            let validator_keypairs =
+                std::array::from_fn::<_, 3, _>(|_| ValidatorVoteKeypairs::new_rand());
+            let mut genesis_config = create_genesis_config_with_alpenglow_vote_accounts(
+                1_000_000_000,
+                &validator_keypairs,
+                vec![100; 3],
+            )
+            .genesis_config;
+            let vote_pubkey = validator_keypairs[2].vote_keypair.pubkey();
+            let mut account =
+                AccountSharedData::from(genesis_config.accounts.get(&vote_pubkey).unwrap().clone());
+            let mut state = VoteStateV4::deserialize(account.data(), &vote_pubkey).unwrap();
+            if duplicate_bls_key {
+                state.bls_pubkey_compressed = Some(
+                    validator_keypairs[1]
+                        .bls_keypair
+                        .public
+                        .to_bytes_compressed(),
+                );
+            } else {
+                state.node_pubkey = validator_keypairs[1].node_keypair.pubkey();
+            }
+            account
+                .set_state(&VoteStateVersions::new_v4(state))
+                .unwrap();
+            genesis_config.accounts.insert(vote_pubkey, account.into());
+
+            let bank = Bank::new_for_tests(&genesis_config);
+            update_on_chain_epoch_stakes(&bank);
+            let snapshot = bank
+                .get_account(&epoch_stakes_address(bank.epoch()))
+                .unwrap();
+            let entries = stakes_format::get_all_entries(snapshot.data()).unwrap();
+            assert_eq!(entries.len(), 3);
+            let vote_accounts = bank.epoch_vote_accounts(bank.epoch() + 1).unwrap();
+            for (index, keypairs) in validator_keypairs.iter().enumerate() {
+                let pubkey = keypairs.vote_keypair.pubkey();
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.vote_pubkey == pubkey)
+                    .unwrap();
+                assert_eq!(entry.alpenglow_rank, if index == 0 { 0 } else { UNRANKED });
+                assert_eq!(entry.delegated_stake, vote_accounts[&pubkey].0);
+            }
+        }
     }
 }
