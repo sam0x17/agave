@@ -3,7 +3,7 @@
 //! Defines the binary layout for epoch stakes accounts stored on-chain.
 //! These accounts store the per-vote-account data the runtime publishes
 //! at every epoch boundary, and are managed by the runtime exclusively.
-//! See SIMD-0511 for the design rationale.
+//! See SIMD-0676 for the design rationale.
 //!
 //! ## Account Layout
 //!
@@ -20,13 +20,14 @@
 //! │   vote_pubkey:                      Pubkey  (32 B, offset   0)   │
 //! │   node_pubkey:                      Pubkey  (32 B, offset  32)   │
 //! │   delegated_stake:                  u64     ( 8 B, offset  64)   │
-//! │   cumulative_credits:               u64     ( 8 B, offset  72)   │
+//! │   accumulated_lamports:             u64     ( 8 B, offset  72)   │
 //! │   inflation_rewards_commission_bps: u16     ( 2 B, offset  80)   │
 //! │   block_revenue_commission_bps:     u16     ( 2 B, offset  82)   │
 //! │   alpenglow_rank:                   u16     ( 2 B, offset  84)   │
 //! │   _reserved:                        [u8;10] (10 B, offset  86)   │
 //! │   bls_pubkey_compressed:            [u8;48](48 B, offset  96)   │
-//! │   _reserved:                        [u8;16] (16 B, offset 144)   │
+//! │   latest_vote:                      u64     ( 8 B, offset 144)   │
+//! │   root_slot:                        u64     ( 8 B, offset 152)   │
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -35,7 +36,10 @@
 //! 10,000. Pre-v4 states use the legacy inflation commission times 100 and a
 //! block-revenue commission of 10,000, following SIMD-0185.
 
-use {solana_clock::Epoch, solana_pubkey::Pubkey};
+use {
+    solana_clock::{Epoch, Slot},
+    solana_pubkey::Pubkey,
+};
 
 /// Current format version.
 pub const VERSION: u32 = 1;
@@ -60,11 +64,13 @@ pub const ENTRY_SIZE: usize = 160;
 const ENTRY_VOTE_PUBKEY_OFFSET: usize = 0;
 const ENTRY_NODE_PUBKEY_OFFSET: usize = 32;
 const ENTRY_DELEGATED_STAKE_OFFSET: usize = 64;
-const ENTRY_CUMULATIVE_CREDITS_OFFSET: usize = 72;
+const ENTRY_ACCUMULATED_LAMPORTS_OFFSET: usize = 72;
 const ENTRY_INFLATION_REWARDS_COMMISSION_BPS_OFFSET: usize = 80;
 const ENTRY_BLOCK_REVENUE_COMMISSION_BPS_OFFSET: usize = 82;
 const ENTRY_ALPENGLOW_RANK_OFFSET: usize = 84;
 const ENTRY_BLS_PUBKEY_COMPRESSED_OFFSET: usize = 96;
+const ENTRY_LATEST_VOTE_OFFSET: usize = 144;
+const ENTRY_ROOT_SLOT_OFFSET: usize = 152;
 
 fn serialized_len(num_entries: usize) -> Option<usize> {
     num_entries
@@ -95,10 +101,11 @@ pub struct EpochStakesEntry {
     pub node_pubkey: Pubkey,
     /// Effective delegated stake at the snapshot, before partitioned rewards payouts.
     pub delegated_stake: u64,
-    /// Cumulative credits at the start of `epoch`, or zero if the vote
-    /// state's credits history is empty. For a continuous counter, the
-    /// difference from the preceding snapshot is credits recorded in `epoch - 1`.
-    pub cumulative_credits: u64,
+    /// Cumulative reward counter at the start of `epoch`, or zero for empty history.
+    /// Alpenglow increments it in lamports, but migration can carry a Tower
+    /// credits offset. Differences measure recorded rewards only across
+    /// continuous, unsaturated Alpenglow snapshots of the same account incarnation.
+    pub accumulated_lamports: u64,
     /// Raw inflation rewards commission in basis points, without clamping.
     /// With SIMD-0249 active, this snapshot supplies the commission for rewards
     /// earned in `epoch + 1`, subject to its missing-vote-account fallback rules.
@@ -111,6 +118,10 @@ pub struct EpochStakesEntry {
     /// Compressed BLS public key from vote account v4. All zeroes when the
     /// vote account does not have a BLS key.
     pub bls_pubkey_compressed: [u8; BLS_PUBKEY_COMPRESSED_SIZE],
+    /// Last voted slot at the snapshot, encoded as `u64::MAX` when absent.
+    pub latest_vote: Option<Slot>,
+    /// Root slot at the snapshot, encoded as `u64::MAX` when absent.
+    pub root_slot: Option<Slot>,
 }
 
 /// Serialize epoch stakes into the on-chain binary format.
@@ -157,8 +168,8 @@ pub fn serialize_epoch_stakes(entries: &[EpochStakesEntry], epoch: Epoch) -> Vec
         );
         write_bytes(
             entry_data,
-            ENTRY_CUMULATIVE_CREDITS_OFFSET,
-            &entry.cumulative_credits.to_le_bytes(),
+            ENTRY_ACCUMULATED_LAMPORTS_OFFSET,
+            &entry.accumulated_lamports.to_le_bytes(),
         );
         write_bytes(
             entry_data,
@@ -180,7 +191,17 @@ pub fn serialize_epoch_stakes(entries: &[EpochStakesEntry], epoch: Epoch) -> Vec
             ENTRY_BLS_PUBKEY_COMPRESSED_OFFSET,
             &entry.bls_pubkey_compressed,
         );
-        // Reserved bytes [86..96] and [144..160] left as zero.
+        write_bytes(
+            entry_data,
+            ENTRY_LATEST_VOTE_OFFSET,
+            &entry.latest_vote.unwrap_or(Slot::MAX).to_le_bytes(),
+        );
+        write_bytes(
+            entry_data,
+            ENTRY_ROOT_SLOT_OFFSET,
+            &entry.root_slot.unwrap_or(Slot::MAX).to_le_bytes(),
+        );
+        // Reserved bytes [86..96] left as zero.
     }
 
     data
@@ -241,8 +262,8 @@ pub fn get_entry(data: &[u8], index: usize) -> Option<EpochStakesEntry> {
     let vote_pubkey = read_pubkey(entry_data, ENTRY_VOTE_PUBKEY_OFFSET)?;
     let node_pubkey = read_pubkey(entry_data, ENTRY_NODE_PUBKEY_OFFSET)?;
     let delegated_stake = u64::from_le_bytes(read_array(entry_data, ENTRY_DELEGATED_STAKE_OFFSET)?);
-    let cumulative_credits =
-        u64::from_le_bytes(read_array(entry_data, ENTRY_CUMULATIVE_CREDITS_OFFSET)?);
+    let accumulated_lamports =
+        u64::from_le_bytes(read_array(entry_data, ENTRY_ACCUMULATED_LAMPORTS_OFFSET)?);
     let inflation_rewards_commission_bps = u16::from_le_bytes(read_array(
         entry_data,
         ENTRY_INFLATION_REWARDS_COMMISSION_BPS_OFFSET,
@@ -253,16 +274,20 @@ pub fn get_entry(data: &[u8], index: usize) -> Option<EpochStakesEntry> {
     )?);
     let alpenglow_rank = u16::from_le_bytes(read_array(entry_data, ENTRY_ALPENGLOW_RANK_OFFSET)?);
     let bls_pubkey_compressed = read_array(entry_data, ENTRY_BLS_PUBKEY_COMPRESSED_OFFSET)?;
+    let latest_vote = u64::from_le_bytes(read_array(entry_data, ENTRY_LATEST_VOTE_OFFSET)?);
+    let root_slot = u64::from_le_bytes(read_array(entry_data, ENTRY_ROOT_SLOT_OFFSET)?);
 
     Some(EpochStakesEntry {
         vote_pubkey,
         node_pubkey,
         delegated_stake,
-        cumulative_credits,
+        accumulated_lamports,
         inflation_rewards_commission_bps,
         block_revenue_commission_bps,
         alpenglow_rank,
         bls_pubkey_compressed,
+        latest_vote: (latest_vote != Slot::MAX).then_some(latest_vote),
+        root_slot: (root_slot != Slot::MAX).then_some(root_slot),
     })
 }
 
@@ -286,11 +311,13 @@ mod tests {
             vote_pubkey: Pubkey::new_from_array([seed; 32]),
             node_pubkey: Pubkey::new_from_array([seed.wrapping_add(1); 32]),
             delegated_stake: stake,
-            cumulative_credits: u64::from(seed) * 1_000,
+            accumulated_lamports: u64::from(seed) * 1_000,
             inflation_rewards_commission_bps: u16::from(seed) * 100,
             block_revenue_commission_bps: 10_000 - u16::from(seed) * 100,
             alpenglow_rank: u16::from(seed),
             bls_pubkey_compressed: [seed; BLS_PUBKEY_COMPRESSED_SIZE],
+            latest_vote: Some(u64::from(seed) * 10),
+            root_slot: Some(u64::from(seed)),
         }
     }
 
@@ -388,18 +415,42 @@ mod tests {
         assert_eq!(&row[0..32], entry.vote_pubkey.as_ref());
         assert_eq!(&row[32..64], entry.node_pubkey.as_ref());
         assert_eq!(&row[64..72], &[1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(&row[72..80], &entry.cumulative_credits.to_le_bytes());
+        assert_eq!(&row[72..80], &entry.accumulated_lamports.to_le_bytes());
         assert_eq!(&row[80..82], &10_001u16.to_le_bytes());
         assert_eq!(&row[82..84], &u16::MAX.to_le_bytes());
         assert_eq!(&row[84..86], &3u16.to_le_bytes());
         assert_eq!(&row[86..96], &[0; 10]);
         assert_eq!(&row[96..144], &entry.bls_pubkey_compressed);
-        assert_eq!(&row[144..160], &[0; 16]);
+        assert_eq!(&row[144..152], &30u64.to_le_bytes());
+        assert_eq!(&row[152..160], &3u64.to_le_bytes());
         assert_eq!(get_entry(&data, 0), Some(entry));
 
         let mut trailing = data;
         trailing.push(0);
         assert!(deserialize_header(&trailing).is_none());
+    }
+
+    #[test]
+    fn test_optional_health_slots_distinguish_absence_from_zero() {
+        for latest_vote in [None, Some(0), Some(Slot::MAX - 1)] {
+            for root_slot in [None, Some(0), Some(Slot::MAX - 1)] {
+                let entry = EpochStakesEntry {
+                    latest_vote,
+                    root_slot,
+                    ..make_entry(1, 100)
+                };
+                let data = serialize_epoch_stakes(&[entry], 1);
+                assert_eq!(
+                    &data[176..184],
+                    &latest_vote.unwrap_or(Slot::MAX).to_le_bytes()
+                );
+                assert_eq!(
+                    &data[184..192],
+                    &root_slot.unwrap_or(Slot::MAX).to_le_bytes()
+                );
+                assert_eq!(get_entry(&data, 0), Some(entry));
+            }
+        }
     }
 
     #[test]
@@ -410,7 +461,9 @@ mod tests {
         assert_eq!(ENTRY_NODE_PUBKEY_OFFSET % 32, 0);
         // u64 fields are 8-byte aligned.
         assert_eq!(ENTRY_DELEGATED_STAKE_OFFSET % 8, 0);
-        assert_eq!(ENTRY_CUMULATIVE_CREDITS_OFFSET % 8, 0);
+        assert_eq!(ENTRY_ACCUMULATED_LAMPORTS_OFFSET % 8, 0);
+        assert_eq!(ENTRY_LATEST_VOTE_OFFSET % 8, 0);
+        assert_eq!(ENTRY_ROOT_SLOT_OFFSET % 8, 0);
         // u16 fields are 2-byte aligned.
         assert_eq!(ENTRY_INFLATION_REWARDS_COMMISSION_BPS_OFFSET % 2, 0);
         assert_eq!(ENTRY_BLOCK_REVENUE_COMMISSION_BPS_OFFSET % 2, 0);

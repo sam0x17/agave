@@ -2643,7 +2643,7 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         ),
         (
             on_chain_epoch_stakes::id(),
-            "SIMD-0511: On-chain epoch stakes accounts",
+            "SIMD-0676: On-chain epoch stakes accounts",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/

@@ -6,7 +6,7 @@
 //! is addressed by a PDA keyed on the snapshot epoch number, so
 //! each epoch has stable data that the runtime writes once. Eight epoch
 //! accounts are retained; older accounts are closed at epoch boundaries.
-//! See SIMD-0511 for the full design.
+//! See SIMD-0676 for the full design.
 
 use {
     crate::bank::Bank,
@@ -79,7 +79,7 @@ fn write_epoch_stakes_account(bank: &Bank, epoch: Epoch) {
                 vote_pubkey: *vote_pubkey,
                 node_pubkey,
                 delegated_stake: *stake,
-                cumulative_credits: view.credits(),
+                accumulated_lamports: view.credits(),
                 inflation_rewards_commission_bps: view.inflation_rewards_commission(),
                 block_revenue_commission_bps: view.block_revenue_commission(),
                 alpenglow_rank: rank_map
@@ -89,6 +89,8 @@ fn write_epoch_stakes_account(bank: &Bank, epoch: Epoch) {
                 bls_pubkey_compressed: view
                     .bls_pubkey_compressed()
                     .unwrap_or([0; BLS_PUBKEY_COMPRESSED_SIZE]),
+                latest_vote: view.last_voted_slot(),
+                root_slot: view.root_slot(),
             }
         })
         .collect();
@@ -154,7 +156,7 @@ mod tests {
         solana_system_interface::instruction as system_instruction,
         solana_transaction::Transaction,
         solana_transaction_error::TransactionError,
-        solana_vote_interface::state::{VoteStateV4, VoteStateVersions},
+        solana_vote_interface::state::{Lockout, VoteStateV4, VoteStateVersions},
         std::{
             collections::BTreeMap,
             sync::{Arc, RwLock},
@@ -196,6 +198,8 @@ mod tests {
         vote_state.inflation_rewards_commission_bps = 10_001;
         vote_state.block_revenue_commission_bps = u16::MAX;
         vote_state.epoch_credits.push((0, 42, 0));
+        vote_state.votes.push_back(Lockout::new(15).into());
+        vote_state.root_slot = Some(10);
         vote_account
             .set_state(&VoteStateVersions::new_v4(vote_state))
             .unwrap();
@@ -209,7 +213,9 @@ mod tests {
         assert_eq!(entry.vote_pubkey, vote_pubkey);
         assert_eq!(entry.inflation_rewards_commission_bps, 10_001);
         assert_eq!(entry.block_revenue_commission_bps, u16::MAX);
-        assert_eq!(entry.cumulative_credits, 42);
+        assert_eq!(entry.accumulated_lamports, 42);
+        assert_eq!(entry.latest_vote, Some(15));
+        assert_eq!(entry.root_slot, Some(10));
         assert!(bank.get_account(&epoch_stakes_address(0)).is_none());
         assert_eq!(
             bank.epoch_vote_accounts(1).unwrap()[&vote_pubkey]
@@ -224,6 +230,9 @@ mod tests {
         let mut live_account = bank.get_account(&vote_pubkey).unwrap();
         let mut live_state = VoteStateV4::deserialize(live_account.data(), &vote_pubkey).unwrap();
         live_state.inflation_rewards_commission_bps = 2_000;
+        live_state.epoch_credits.push((1, 100, 42));
+        live_state.votes.clear();
+        live_state.root_slot = None;
         live_account
             .set_state(&VoteStateVersions::new_v4(live_state))
             .unwrap();
@@ -583,7 +592,7 @@ mod tests {
     }
 
     /// Verify the on-chain epoch stakes match what the bank has internally,
-    /// across every per-vote-account field defined by SIMD-0511.
+    /// across every per-vote-account field defined by SIMD-0676.
     #[test]
     fn test_on_chain_matches_bank_epoch_stakes() {
         let leader_pubkey = solana_pubkey::new_rand();
@@ -625,7 +634,9 @@ mod tests {
                 entry.block_revenue_commission_bps,
                 view.block_revenue_commission()
             );
-            assert_eq!(entry.cumulative_credits, view.credits());
+            assert_eq!(entry.accumulated_lamports, view.credits());
+            assert_eq!(entry.latest_vote, view.last_voted_slot());
+            assert_eq!(entry.root_slot, view.root_slot());
             assert_eq!(entry.alpenglow_rank, UNRANKED);
             assert_eq!(
                 entry.bls_pubkey_compressed,
