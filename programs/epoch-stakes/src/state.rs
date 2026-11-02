@@ -14,7 +14,7 @@
 //! │   num_entries: u32      - vote accounts in table                 │
 //! │   epoch: u64            - epoch of the snapshot                 │
 //! │   total_stake: u64      - sum of all delegated stake             │
-//! │   _reserved: [u8; 8]    - must be zero                           │
+//! │   _padding: [u8; 8]     - must be zero                           │
 //! ├──────────────────────────────────────────────────────────────────┤
 //! │ Entries (num_entries x 160 bytes), sorted by vote_pubkey:        │
 //! │   vote_pubkey:                      Pubkey  (32 B, offset   0)   │
@@ -24,12 +24,15 @@
 //! │   inflation_rewards_commission_bps: u16     ( 2 B, offset  80)   │
 //! │   block_revenue_commission_bps:     u16     ( 2 B, offset  82)   │
 //! │   alpenglow_rank:                   u16     ( 2 B, offset  84)   │
-//! │   _reserved:                        [u8;10] (10 B, offset  86)   │
+//! │   _padding:                         [u8;10] (10 B, offset  86)   │
 //! │   bls_pubkey_compressed:            [u8;48](48 B, offset  96)   │
 //! │   latest_vote:                      u64     ( 8 B, offset 144)   │
 //! │   root_slot:                        u64     ( 8 B, offset 152)   │
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! Version 1 has immutable field meanings and layout, including zero padding.
+//! Reusing padding or changing a field requires a new format version.
 //!
 //! Entries have a fixed stride of 160 bytes and begin after the 32-byte header.
 //! Commission fields preserve raw vote-account v4 values, including values above
@@ -145,7 +148,7 @@ pub fn serialize_epoch_stakes(entries: &[EpochStakesEntry], epoch: Epoch) -> Vec
     data[4..8].copy_from_slice(&num_entries.to_le_bytes());
     data[8..16].copy_from_slice(&epoch.to_le_bytes());
     data[16..24].copy_from_slice(&total_stake.to_le_bytes());
-    // Reserved bytes [24..32] left as zero.
+    // Padding bytes [24..32] left as zero.
 
     // Entries.
     let (entry_data, remainder) = data[HEADER_SIZE..].as_chunks_mut::<ENTRY_SIZE>();
@@ -201,7 +204,7 @@ pub fn serialize_epoch_stakes(entries: &[EpochStakesEntry], epoch: Epoch) -> Vec
             ENTRY_ROOT_SLOT_OFFSET,
             &entry.root_slot.unwrap_or(Slot::MAX).to_le_bytes(),
         );
-        // Reserved bytes [86..96] left as zero.
+        // Padding bytes [86..96] left as zero.
     }
 
     data
