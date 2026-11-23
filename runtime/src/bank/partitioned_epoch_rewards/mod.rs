@@ -1220,7 +1220,15 @@ mod tests {
                         .get_epoch_rewards_from_cache(&curr_bank.parent_hash)
                         .is_some()
                 );
-                assert_eq!(post_cap, pre_cap);
+                // Rewards have not been paid yet, but the boundary funds its
+                // newly published epoch stakes account.
+                assert_eq!(
+                    post_cap,
+                    pre_cap
+                        + curr_bank.get_balance(
+                            &crate::on_chain_epoch_stakes::epoch_stakes_address(curr_bank.epoch())
+                        )
+                );
 
                 // Make a root the bank, which is the first bank in the epoch.
                 // This will clear the cache.

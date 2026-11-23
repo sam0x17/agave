@@ -387,6 +387,8 @@ fn test_bank_update_epoch_stakes() {
 
     let mut bank = create_simple_test_bank(100_000);
 
+    Arc::make_mut(&mut bank.feature_set).deactivate(&feature_set::on_chain_epoch_stakes::id());
+
     let initial_epochs = bank.epoch_stake_keys();
     assert_eq!(initial_epochs, vec![0, 1]);
 
@@ -5513,9 +5515,9 @@ fn test_bank_hash_consistency(deprecate_rent_exemption_threshold: bool) {
             assert_eq!(
                 bank.hash().to_string(),
                 if deprecate_rent_exemption_threshold {
-                    "TDnXLFxaMVtN4KFKmdSc28zTfQjd2sPVazrVkfUFv3G"
+                    "HM21W47E6KZcbd5ro8dtYesx4c5edFhK7FrLzcm8jjc6"
                 } else {
-                    "9HL7PKa6Xt6CPqJFmdM4zWziH2YZzA7U92cbhLvTuubF"
+                    "4fQg9VgRWuGhAEfJP7BWNP65Gvdo9yfL1koqVPUohixV"
                 },
             );
         }
@@ -5524,9 +5526,9 @@ fn test_bank_hash_consistency(deprecate_rent_exemption_threshold: bool) {
             assert_eq!(
                 bank.hash().to_string(),
                 if deprecate_rent_exemption_threshold {
-                    "G8mgrJ1vGXTfjRS8mmjYeHzkGwRLN5jvyirpApzB6Box"
+                    "GUJfPUoR8fwhFfJGW3iLHKKPZt66KSTKtBYTcojZgnfa"
                 } else {
-                    "6wrhEo1vT3P6bH8SuJrs7orouw7ivBkWs2XetuneH3hT"
+                    "BjefKBX2mH6ieeCyrm7wXWknhTis6CAizyJ4E5UADFSt"
                 },
             );
             break;
@@ -5826,7 +5828,7 @@ fn test_bank_hash_deterministic_with_stakes_cache() {
 
     assert_eq!(
         bank2.hash().to_string(),
-        "FhK44Rm28aCttSnQr5BpxBaNW526YmFW21wUNBNUNcQm",
+        "6wSRBRhhA5NY8WPDjVrkz5usD9XX2t78UcKQEuxEWVa4",
     );
 }
 

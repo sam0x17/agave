@@ -9,7 +9,7 @@
 //! See SIMD-0676 for the full design.
 
 use {
-    crate::bank::Bank,
+    crate::{bank::Bank, epoch_stakes::VersionedEpochStakes},
     solana_account::{AccountSharedData, ReadableAccount},
     solana_clock::Epoch,
     solana_epoch_stakes_program::state::{
@@ -17,6 +17,9 @@ use {
         UNRANKED,
     },
     solana_pubkey::Pubkey,
+    solana_vote::vote_account::{VoteAccount, VoteAccounts},
+    solana_vote_interface::state::VoteStateVersions,
+    std::{collections::HashMap, sync::Arc},
 };
 
 /// PDA seed prefix for epoch stakes accounts.
@@ -63,18 +66,24 @@ fn write_epoch_stakes_account(bank: &Bank, epoch: Epoch) {
     let Some(epoch_stakes) = bank.epoch_stakes(epoch + 1) else {
         return;
     };
-    let vote_accounts = epoch_stakes.stakes().vote_accounts().as_ref();
-    let rank_map = bank
-        .feature_set
-        .snapshot()
-        .alpenglow
-        .then(|| epoch_stakes.bls_pubkey_to_rank_map());
+    let entries = snapshot_entries(epoch_stakes, bank.feature_set.snapshot().alpenglow);
 
-    let entries: Vec<EpochStakesEntry> = vote_accounts
+    let data = stakes_format::serialize_epoch_stakes(&entries, epoch);
+    store_program_account(bank, &addr, &data);
+}
+
+fn snapshot_entries(epoch_stakes: &VersionedEpochStakes, alpenglow: bool) -> Vec<EpochStakesEntry> {
+    let vote_accounts = epoch_stakes.stakes().vote_accounts().as_ref();
+    let rank_map = alpenglow
+        .then(|| epoch_stakes.try_bls_pubkey_to_rank_map())
+        .flatten();
+
+    vote_accounts
         .iter()
         .map(|(vote_pubkey, (stake, vote_account))| {
             let view = vote_account.vote_state_view();
             let node_pubkey = *vote_account.node_pubkey();
+            let reward = view.epoch_credits_iter().last();
             EpochStakesEntry {
                 vote_pubkey: *vote_pubkey,
                 node_pubkey,
@@ -82,7 +91,7 @@ fn write_epoch_stakes_account(bank: &Bank, epoch: Epoch) {
                 accumulated_lamports: view.credits(),
                 inflation_rewards_commission_bps: view.inflation_rewards_commission(),
                 block_revenue_commission_bps: view.block_revenue_commission(),
-                alpenglow_rank: rank_map
+                bls_signer_index: rank_map
                     .and_then(|rank_map| rank_map.get_rank_for_vote_pubkey(vote_pubkey))
                     .copied()
                     .unwrap_or(UNRANKED),
@@ -91,12 +100,154 @@ fn write_epoch_stakes_account(bank: &Bank, epoch: Epoch) {
                     .unwrap_or([0; BLS_PUBKEY_COMPRESSED_SIZE]),
                 latest_vote: view.last_voted_slot(),
                 root_slot: view.root_slot(),
+                pending_delegator_rewards: view.pending_delegator_rewards(),
+                last_reward_epoch: reward.map(|item| item.epoch()),
+                previous_accumulated_lamports: reward.map_or(0, |item| item.prev_credits()),
+                inflation_rewards_collector: view
+                    .inflation_rewards_collector()
+                    .copied()
+                    .unwrap_or(*vote_pubkey),
+                block_revenue_collector: view
+                    .block_revenue_collector()
+                    .copied()
+                    .unwrap_or(node_pubkey),
+                // The vote-state versions supported by this revision have no location.
+                location: [0; 3],
             }
         })
-        .collect();
+        .collect()
+}
 
-    let data = stakes_format::serialize_epoch_stakes(&entries, epoch);
-    store_program_account(bank, &addr, &data);
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RestoreError {
+    #[error("missing epoch stakes account for snapshot epoch {0}")]
+    Missing(Epoch),
+    #[error("invalid epoch stakes account for snapshot epoch {0}")]
+    Invalid(Epoch),
+    #[error("epoch stakes account disagrees with snapshot manifest for epoch {0}")]
+    ManifestMismatch(Epoch),
+    #[error("missing legacy epoch stakes inputs for snapshot epoch {0}")]
+    MissingLegacy(Epoch),
+}
+
+/// Reconstruct published cache fields from this bank's restored accounts.
+/// Full historical vote states remain required for fields absent from the account
+/// format, including authorized voters and migration reward history.
+pub(crate) fn restore_epoch_stakes(
+    bank: &Bank,
+) -> Result<HashMap<Epoch, VersionedEpochStakes>, RestoreError> {
+    let mut restored = bank.epoch_stakes_map().clone();
+    let Some(activation_slot) = bank
+        .feature_set
+        .activated_slot(&agave_feature_set::on_chain_epoch_stakes::id())
+    else {
+        return Ok(restored);
+    };
+    // Genesis does not run process_new_epoch. The first publication is at the
+    // first actual epoch boundary, even when the feature starts active.
+    let activation_epoch = bank.epoch_schedule().get_epoch(activation_slot).max(1);
+    let first = activation_epoch.max(bank.epoch().saturating_sub(RETAINED_EPOCHS - 1));
+    for epoch in first..=bank.epoch() {
+        let consensus_epoch = epoch.checked_add(1).ok_or(RestoreError::Invalid(epoch))?;
+        let legacy = restored.get(&consensus_epoch);
+        let required = epoch == bank.epoch() || legacy.is_some();
+        let account = bank.get_account_with_fixed_root(&epoch_stakes_address(epoch));
+        let Some(account) =
+            account.filter(|account| account.owner() == &solana_epoch_stakes_program::id())
+        else {
+            if required {
+                return Err(RestoreError::Missing(epoch));
+            }
+            continue;
+        };
+        let header = stakes_format::deserialize_header(account.data())
+            .ok_or(RestoreError::Invalid(epoch))?;
+        let entries =
+            stakes_format::get_all_entries(account.data()).ok_or(RestoreError::Invalid(epoch))?;
+        if header.epoch != epoch || account.executable() {
+            return Err(RestoreError::Invalid(epoch));
+        }
+        let legacy = legacy.ok_or(RestoreError::MissingLegacy(epoch))?;
+        let mut expected = snapshot_entries(legacy, bank.feature_set.snapshot().alpenglow);
+        expected.sort_by_key(|entry| entry.vote_pubkey);
+        if entries != expected {
+            return Err(RestoreError::ManifestMismatch(epoch));
+        }
+        let mut vote_accounts = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            let historical = &legacy.stakes().vote_accounts().as_ref()[&entry.vote_pubkey].1;
+            let account =
+                restore_vote_account(&entry, historical).ok_or(RestoreError::Invalid(epoch))?;
+            vote_accounts.insert(entry.vote_pubkey, (entry.delegated_stake, account));
+        }
+        let rebuilt = legacy.with_restored_vote_accounts(
+            VoteAccounts::from(Arc::new(vote_accounts)),
+            consensus_epoch,
+        );
+        // Do not trust serialized derived maps either. Rebuild identity and
+        // authorized-voter mappings and check the stored signer indices above.
+        let normalized_nodes = |stakes: &VersionedEpochStakes| {
+            let mut nodes = stakes.node_id_to_vote_accounts().as_ref().clone();
+            for node in nodes.values_mut() {
+                node.vote_accounts.sort_unstable();
+            }
+            nodes
+        };
+        if rebuilt.total_stake() != legacy.total_stake()
+            || normalized_nodes(&rebuilt) != normalized_nodes(legacy)
+            || rebuilt.epoch_authorized_voters() != legacy.epoch_authorized_voters()
+        {
+            return Err(RestoreError::ManifestMismatch(epoch));
+        }
+        restored.insert(consensus_epoch, rebuilt);
+    }
+    Ok(restored)
+}
+
+fn restore_vote_account(entry: &EpochStakesEntry, legacy: &VoteAccount) -> Option<VoteAccount> {
+    use solana_account::state_traits::StateMutWincode;
+    let mut account = legacy.account().clone();
+    let mut state: VoteStateVersions = account.state().ok()?;
+    // Matching fields were checked before this call. Retain all omitted fields,
+    // vote lockouts and prior reward tuples rather than inventing a full state.
+    let credits = match &mut state {
+        VoteStateVersions::V4(state) => {
+            state.node_pubkey = entry.node_pubkey;
+            state.inflation_rewards_collector = entry.inflation_rewards_collector;
+            state.block_revenue_collector = entry.block_revenue_collector;
+            state.inflation_rewards_commission_bps = entry.inflation_rewards_commission_bps;
+            state.block_revenue_commission_bps = entry.block_revenue_commission_bps;
+            state.pending_delegator_rewards = entry.pending_delegator_rewards;
+            // Keep None distinct from a present all-zero key in legacy inputs.
+            state.bls_pubkey_compressed = state
+                .bls_pubkey_compressed
+                .map(|_| entry.bls_pubkey_compressed);
+            state.root_slot = entry.root_slot;
+            &mut state.epoch_credits
+        }
+        VoteStateVersions::V3(state) => {
+            state.node_pubkey = entry.node_pubkey;
+            state.commission = u8::try_from(entry.inflation_rewards_commission_bps / 100).ok()?;
+            state.root_slot = entry.root_slot;
+            &mut state.epoch_credits
+        }
+        VoteStateVersions::V1_14_11(state) => {
+            state.node_pubkey = entry.node_pubkey;
+            state.commission = u8::try_from(entry.inflation_rewards_commission_bps / 100).ok()?;
+            state.root_slot = entry.root_slot;
+            &mut state.epoch_credits
+        }
+        VoteStateVersions::Uninitialized => return None,
+    };
+    if let Some(epoch) = entry.last_reward_epoch {
+        *credits.last_mut()? = (
+            epoch,
+            entry.accumulated_lamports,
+            entry.previous_accumulated_lamports,
+        );
+    }
+    account.set_state(&state).ok()?;
+    VoteAccount::try_from(account).ok()
 }
 
 fn close_expired_accounts(bank: &Bank) {
@@ -197,7 +348,12 @@ mod tests {
         let mut vote_state = VoteStateV4::deserialize(vote_account.data(), &vote_pubkey).unwrap();
         vote_state.inflation_rewards_commission_bps = 10_001;
         vote_state.block_revenue_commission_bps = u16::MAX;
-        vote_state.epoch_credits.push((0, 42, 0));
+        vote_state.epoch_credits.push((0, 42, 17));
+        vote_state.pending_delegator_rewards = 23;
+        vote_state.inflation_rewards_collector = Pubkey::new_unique();
+        vote_state.block_revenue_collector = Pubkey::new_unique();
+        let expected_inflation_collector = vote_state.inflation_rewards_collector;
+        let expected_block_collector = vote_state.block_revenue_collector;
         vote_state.votes.push_back(Lockout::new(15).into());
         vote_state.root_slot = Some(10);
         vote_account
@@ -214,6 +370,15 @@ mod tests {
         assert_eq!(entry.inflation_rewards_commission_bps, 10_001);
         assert_eq!(entry.block_revenue_commission_bps, u16::MAX);
         assert_eq!(entry.accumulated_lamports, 42);
+        assert_eq!(entry.last_reward_epoch, Some(0));
+        assert_eq!(entry.previous_accumulated_lamports, 17);
+        assert_eq!(entry.pending_delegator_rewards, 23);
+        assert_eq!(
+            entry.inflation_rewards_collector,
+            expected_inflation_collector
+        );
+        assert_eq!(entry.block_revenue_collector, expected_block_collector);
+        assert_eq!(entry.location, [0; 3]);
         assert_eq!(entry.latest_vote, Some(15));
         assert_eq!(entry.root_slot, Some(10));
         assert!(bank.get_account(&epoch_stakes_address(0)).is_none());
@@ -456,6 +621,15 @@ mod tests {
                     .is_none()
             );
 
+            let restored = restore_epoch_stakes(&bank).unwrap();
+            assert_eq!(restored.len(), bank.epoch_stakes_map().len());
+            for (epoch, stakes) in &restored {
+                assert_eq!(
+                    stakes.stakes().vote_accounts(),
+                    bank.epoch_stakes(*epoch).unwrap().stakes().vote_accounts()
+                );
+            }
+
             // Running the update again neither republishes expired epochs nor
             // changes the supply or account-data accounting.
             let capitalization = bank.capitalization();
@@ -589,6 +763,7 @@ mod tests {
         }
         assert!(bank.get_account(&epoch_stakes_address(12)).is_some());
         assert!(bank.get_account(&epoch_stakes_address(13)).is_none());
+        assert!(restore_epoch_stakes(&bank).is_ok());
     }
 
     /// Verify the on-chain epoch stakes match what the bank has internally,
@@ -637,7 +812,7 @@ mod tests {
             assert_eq!(entry.accumulated_lamports, view.credits());
             assert_eq!(entry.latest_vote, view.last_voted_slot());
             assert_eq!(entry.root_slot, view.root_slot());
-            assert_eq!(entry.alpenglow_rank, UNRANKED);
+            assert_eq!(entry.bls_signer_index, UNRANKED);
             assert_eq!(
                 entry.bls_pubkey_compressed,
                 view.bls_pubkey_compressed()
@@ -647,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn test_alpenglow_rank_matches_bank_rank_map() {
+    fn test_bls_signer_index_matches_bank_rank_map() {
         let validator_keypairs = [ValidatorVoteKeypairs::new_rand()];
         let genesis_config = create_genesis_config_with_alpenglow_vote_accounts(
             1_000_000_000,
@@ -673,9 +848,9 @@ mod tests {
             rank_map
                 .get_rank_for_vote_pubkey(&entries[0].vote_pubkey)
                 .copied(),
-            Some(entries[0].alpenglow_rank)
+            Some(entries[0].bls_signer_index)
         );
-        assert_eq!(entries[0].alpenglow_rank, 0);
+        assert_eq!(entries[0].bls_signer_index, 0);
         assert_ne!(
             entries[0].bls_pubkey_compressed,
             [0; BLS_PUBKEY_COMPRESSED_SIZE]
@@ -726,9 +901,191 @@ mod tests {
                     .iter()
                     .find(|entry| entry.vote_pubkey == pubkey)
                     .unwrap();
-                assert_eq!(entry.alpenglow_rank, if index == 0 { 0 } else { UNRANKED });
+                assert_eq!(
+                    entry.bls_signer_index,
+                    if index == 0 { 0 } else { UNRANKED }
+                );
                 assert_eq!(entry.delegated_stake, vote_accounts[&pubkey].0);
             }
         }
+    }
+    #[test]
+    fn test_epoch_stakes_restore_rejects_corruption_and_missing_inputs() {
+        let (bank, forks) =
+            Bank::new_for_tests(&retention_test_genesis()).wrap_with_bank_forks_for_tests();
+        let bank = bank_at_epoch(&forks, bank, 1);
+        let address = epoch_stakes_address(1);
+        let original = bank.get_account(&address).unwrap();
+        assert!(restore_epoch_stakes(&bank).is_ok());
+        // Cover version, length, epoch, total, both padding areas and every
+        // published field, including fields absent from current vote states.
+        for offset in [
+            0, 4, 8, 16, 24, 32, 64, 96, 104, 112, 114, 116, 118, 128, 176, 184, 192, 200, 208,
+            216, 248, 280, 292,
+        ] {
+            let mut invalid = original.clone();
+            let mut data = invalid.data().to_vec();
+            data[offset] ^= 1;
+            invalid.set_data_from_slice(&data);
+            bank.store_account(&address, &invalid);
+            assert!(
+                restore_epoch_stakes(&bank).is_err(),
+                "accepted byte {offset}"
+            );
+        }
+        bank.store_account(&address, &AccountSharedData::default());
+        assert!(matches!(
+            restore_epoch_stakes(&bank),
+            Err(RestoreError::Missing(1))
+        ));
+        bank.store_account(
+            &address,
+            &AccountSharedData::new(10, 0, &system_program::id()),
+        );
+        assert!(matches!(
+            restore_epoch_stakes(&bank),
+            Err(RestoreError::Missing(1))
+        ));
+        bank.store_account(&address, &original);
+        assert!(restore_epoch_stakes(&bank).is_ok());
+    }
+
+    #[test]
+    fn test_epoch_stakes_restore_preserves_old_reward_history_and_authorities() {
+        let (bank, forks) =
+            Bank::new_for_tests(&retention_test_genesis()).wrap_with_bank_forks_for_tests();
+        let key = *bank.epoch_vote_accounts(1).unwrap().keys().next().unwrap();
+        let mut account = bank.get_account(&key).unwrap();
+        let mut state = VoteStateV4::deserialize(account.data(), &key).unwrap();
+        state.epoch_credits = vec![(0, 100, 50), (1, 110, 100)];
+        account
+            .set_state(&VoteStateVersions::new_v4(state))
+            .unwrap();
+        bank.store_account(&key, &account);
+        let bank = bank_at_epoch(&forks, bank, 20);
+        let entry = stakes_format::get_entry(
+            bank.get_account(&epoch_stakes_address(20)).unwrap().data(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                entry.last_reward_epoch,
+                entry.accumulated_lamports,
+                entry.previous_accumulated_lamports
+            ),
+            (Some(1), 110, 100)
+        );
+        let restored = restore_epoch_stakes(&bank).unwrap();
+        assert_eq!(
+            restored[&21].stakes().vote_accounts().as_ref(),
+            bank.epoch_vote_accounts(21).unwrap()
+        );
+        assert_eq!(
+            restored[&21].epoch_authorized_voters(),
+            bank.epoch_stakes(21).unwrap().epoch_authorized_voters()
+        );
+    }
+
+    #[test]
+    fn test_epoch_stakes_full_and_incremental_snapshot_restore() {
+        use {
+            crate::{
+                runtime_config::RuntimeConfig,
+                snapshot_bank_utils::{
+                    bank_from_snapshot_archives, bank_to_full_snapshot_archive,
+                    bank_to_incremental_snapshot_archive,
+                },
+            },
+            agave_snapshots::snapshot_config::SnapshotConfig,
+            solana_accounts_db::accounts_db::ACCOUNTS_DB_CONFIG_FOR_TESTING,
+            solana_hash::Hash,
+            tempfile::TempDir,
+        };
+        let genesis = retention_test_genesis();
+        let (mut bank, forks) = Bank::new_for_tests(&genesis).wrap_with_bank_forks_for_tests();
+        for epoch in 1..=9 {
+            bank = bank_at_epoch(&forks, bank, epoch);
+        }
+        bank.fill_bank_with_ticks_for_tests();
+        bank.set_block_id(Some(Hash::default()));
+        let dirs: [TempDir; 3] = std::array::from_fn(|_| TempDir::new().unwrap());
+        let config = SnapshotConfig {
+            bank_snapshots_dir: dirs[0].path().to_path_buf(),
+            full_snapshot_archives_dir: dirs[1].path().to_path_buf(),
+            incremental_snapshot_archives_dir: dirs[2].path().to_path_buf(),
+            ..SnapshotConfig::default()
+        };
+        let full = bank_to_full_snapshot_archive(&config, &bank).unwrap();
+        let restore = |bank: &Bank, incremental| {
+            let accounts = TempDir::new().unwrap();
+            let restored = bank_from_snapshot_archives(
+                &[accounts.path().to_path_buf()],
+                &full,
+                incremental,
+                &config,
+                &genesis,
+                &RuntimeConfig::default(),
+                None,
+                Some(*bank.leader()),
+                None,
+                false,
+                false,
+                ACCOUNTS_DB_CONFIG_FOR_TESTING,
+                None,
+                Arc::default(),
+            )
+            .unwrap();
+            assert_eq!(restored.epoch(), bank.epoch());
+            assert_eq!(
+                restored.epoch_stakes_map().len(),
+                bank.epoch_stakes_map().len()
+            );
+            for (epoch, expected) in bank.epoch_stakes_map() {
+                assert_eq!(
+                    restored
+                        .epoch_stakes(*epoch)
+                        .unwrap()
+                        .stakes()
+                        .vote_accounts(),
+                    expected.stakes().vote_accounts()
+                );
+            }
+            for epoch in bank.epoch().saturating_sub(7)..=bank.epoch() {
+                let address = epoch_stakes_address(epoch);
+                assert_eq!(restored.get_account(&address), bank.get_account(&address));
+            }
+        };
+        restore(&bank, None);
+        let full_slot = bank.slot();
+        bank = bank_at_epoch(&forks, bank, 10);
+        bank.fill_bank_with_ticks_for_tests();
+        bank.set_block_id(Some(Hash::default()));
+        let incremental = bank_to_incremental_snapshot_archive(&config, &bank, full_slot).unwrap();
+        restore(&bank, Some(&incremental));
+    }
+    #[test]
+    fn test_epoch_stakes_without_eligible_bls_signers() {
+        let bank = Bank::new_for_tests(&retention_test_genesis());
+        let mut accounts = bank.epoch_vote_accounts(1).unwrap().clone();
+        for (key, (_, vote_account)) in &mut accounts {
+            let mut account = vote_account.account().clone();
+            let mut state = VoteStateV4::deserialize(account.data(), key).unwrap();
+            state.bls_pubkey_compressed = None;
+            account
+                .set_state(&VoteStateVersions::new_v4(state))
+                .unwrap();
+            *vote_account = VoteAccount::try_from(account).unwrap();
+        }
+        let stakes = VersionedEpochStakes::new_for_tests(accounts, 1);
+        let entries = snapshot_entries(&stakes, true);
+        assert!(!entries.is_empty());
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.bls_signer_index == UNRANKED)
+        );
+        let empty = VersionedEpochStakes::new_for_tests(HashMap::new(), 1);
+        assert!(snapshot_entries(&empty, true).is_empty());
     }
 }

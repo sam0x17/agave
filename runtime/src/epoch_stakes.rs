@@ -69,6 +69,10 @@ pub(crate) fn bls_pubkey_compressed_bytes_to_bls_pubkey(
 
 impl BLSPubkeyToRankMap {
     pub fn new(epoch_vote_accounts_hash_map: &VoteAccountsHashMap) -> Self {
+        Self::try_new(epoch_vote_accounts_hash_map).expect("total stakes should not be 0")
+    }
+
+    fn try_new(epoch_vote_accounts_hash_map: &VoteAccountsHashMap) -> Option<Self> {
         let mut candidates = Vec::with_capacity(epoch_vote_accounts_hash_map.len());
         let mut bls_pubkey_counts = HashMap::new();
         let mut node_pubkey_counts = HashMap::new();
@@ -108,7 +112,7 @@ impl BLSPubkeyToRankMap {
             .fold(0u64, |stake, (entry, _)| {
                 stake.saturating_add(entry.stake.get())
             });
-        let total_stake = NonZero::new(total_stake).expect("total stakes should not be 0");
+        let total_stake = NonZero::new(total_stake)?;
         keys_stake_entry_with_compressed.sort_by(
             |(a_entry, a_pubkey_compressed), (b_entry, b_pubkey_compressed)| {
                 b_entry
@@ -130,12 +134,12 @@ impl BLSPubkeyToRankMap {
             node_pubkey_to_rank.insert(entry.node_pubkey, rank);
             sorted_pubkeys.push(entry);
         }
-        Self {
+        Some(Self {
             vote_pubkey_to_rank: vote_pubkey_to_rank_map,
             sorted_pubkeys,
             total_stake,
             node_pubkey_to_rank,
-        }
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -284,6 +288,24 @@ impl VersionedEpochStakes {
         )
     }
 
+    pub(crate) fn with_restored_vote_accounts(
+        &self,
+        vote_accounts: VoteAccounts,
+        consensus_epoch: Epoch,
+    ) -> Self {
+        let mut stakes = self.stakes().clone();
+        stakes.vote_accounts = vote_accounts;
+        let (total_stake, node_id_to_vote_accounts, epoch_authorized_voters) =
+            Self::parse_epoch_vote_accounts(stakes.vote_accounts.as_ref(), consensus_epoch);
+        Self::Current {
+            stakes,
+            total_stake,
+            node_id_to_vote_accounts: Arc::new(node_id_to_vote_accounts),
+            epoch_authorized_voters: Arc::new(epoch_authorized_voters),
+            bls_pubkey_to_rank_map: OnceLock::new(),
+        }
+    }
+
     pub fn stakes(&self) -> &EpochStakes {
         match self {
             Self::Current { stakes, .. } => stakes,
@@ -334,16 +356,22 @@ impl VersionedEpochStakes {
     }
 
     pub fn bls_pubkey_to_rank_map(&self) -> &Arc<BLSPubkeyToRankMap> {
-        match self {
-            Self::Current {
-                bls_pubkey_to_rank_map,
-                ..
-            } => bls_pubkey_to_rank_map.get_or_init(|| {
-                Arc::new(BLSPubkeyToRankMap::new(
-                    self.stakes().vote_accounts().as_ref(),
-                ))
-            }),
+        self.try_bls_pubkey_to_rank_map()
+            .expect("total stakes should not be 0")
+    }
+
+    /// Metadata can describe an empty signer set even though consensus needs
+    /// nonzero eligible stake. Preserve all admitted entries as unranked.
+    pub(crate) fn try_bls_pubkey_to_rank_map(&self) -> Option<&Arc<BLSPubkeyToRankMap>> {
+        let Self::Current {
+            bls_pubkey_to_rank_map,
+            ..
+        } = self;
+        if bls_pubkey_to_rank_map.get().is_none() {
+            let rank_map = BLSPubkeyToRankMap::try_new(self.stakes().vote_accounts().as_ref())?;
+            let _ = bls_pubkey_to_rank_map.set(Arc::new(rank_map));
         }
+        bls_pubkey_to_rank_map.get()
     }
 
     /// Returns the stake in Lamports for the given vote_account.

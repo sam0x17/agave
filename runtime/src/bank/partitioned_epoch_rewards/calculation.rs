@@ -3724,9 +3724,14 @@ mod tests {
         assert_eq!(point_value.rewards, expected_rewards);
         assert_eq!(point_value.points, expected_points);
         if let Some(parent_cap) = parent_capitalization {
+            // These boundaries also fund a new epoch stakes account.
             assert_eq!(
                 bank.capitalization(),
-                parent_cap + expected_reward_commissions
+                parent_cap
+                    + expected_reward_commissions
+                    + bank.get_balance(&crate::on_chain_epoch_stakes::epoch_stakes_address(
+                        bank.epoch()
+                    ))
             );
         }
     }

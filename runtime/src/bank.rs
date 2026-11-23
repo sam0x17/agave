@@ -2784,10 +2784,20 @@ impl Bank {
         //  if my parent didn't populate for this staker's epoch, we've
         //  crossed a boundary
         if !self.epoch_stakes.contains_key(&leader_schedule_epoch) {
+            // Snapshot restoration still needs omitted legacy vote-state fields
+            // for every retained on-chain account, not just the consensus cache.
+            let retained_epochs = if self
+                .feature_set
+                .is_active(&feature_set::on_chain_epoch_stakes::id())
+            {
+                MAX_LEADER_SCHEDULE_STAKES.max(solana_epoch_stakes_program::state::RETAINED_EPOCHS)
+            } else {
+                MAX_LEADER_SCHEDULE_STAKES
+            };
             self.epoch_stakes.retain(|&epoch, _| {
                 // Note the greater-than-or-equal (and the `- 1`) is needed here
                 // to ensure we retain the oldest epoch, if that epoch is 0.
-                epoch >= leader_schedule_epoch.saturating_sub(MAX_LEADER_SCHEDULE_STAKES - 1)
+                epoch >= leader_schedule_epoch.saturating_sub(retained_epochs - 1)
             });
             // At the epoch boundary, `compute_new_epoch_caches_and_rewards`
             // has already produced the VAT-filtered vote-account snapshot;
@@ -6335,6 +6345,8 @@ impl Bank {
         }
 
         self.compute_and_apply_features_after_snapshot_restore();
+        self.epoch_stakes = crate::on_chain_epoch_stakes::restore_epoch_stakes(self)
+            .expect("on-chain epoch stakes are inconsistent with the snapshot");
         if self.feature_set.snapshot().remove_inactive_stakes {
             self.stakes_cache.remove_inert_stake_delegations(
                 self.new_warmup_cooldown_rate_epoch(),
